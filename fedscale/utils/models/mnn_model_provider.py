@@ -7,18 +7,40 @@ import numpy as np
 import torch
 from torch import Tensor
 
+cache_path = "../../cloud/aggregation/cache/"
+script_path = "../../../scripts/"
 
-def init_keymap(model_weights: dict, mnn_json) -> dict:
+
+def build_simple_linear(args):
+    return torch.nn.Sequential([
+        torch.nn.Flatten(),
+        torch.nn.Linear(np.prod(args.input_shape), args.num_classes),
+        torch.nn.Softmax(dim=1)
+    ])
+
+
+_models = {
+    'linear': build_simple_linear,
+}
+
+
+def get_mnn_model(name: str, args):
+    if name not in _models:
+        raise ValueError(f"Unsupported model: {name}")
+    return _models[name](args)
+
+
+def init_keymap(model_weights: dict) -> dict:
     """
     Match keys from mnn to torch.
-    
+
     MNN do not support mnn->torch conversion 
     and do not keep keys inside state_dict when converted from torch model.
-    
+
     MNN can be converted to JSON, which has a list of operations.
     Some operations have trainable parameters.
     All operations have a type.
-    
+
     We currently support getting the key map of 
     two types of operations which have trainable operations:
         1. Convolution: weight, bias.
@@ -38,11 +60,17 @@ def init_keymap(model_weights: dict, mnn_json) -> dict:
 
     Args:
         model_weights (dict): PyTorch model weights in state_dict.
-        mnn_json (JSON object): MNN model in JSON format.
 
     Returns:
         dict: MNN oplist index -> PyTorch state_dict key map.
     """
+    # load converted JSON file to mnn_json
+    subprocess.call([
+        f"{script_path}MNNDump2Json",
+        f"{cache_path}model.mnn",
+        f"{cache_path}model.json"])
+    with open('../../cloud/aggregation/cache/model.json') as f:
+        mnn_json = json.load(f)
     keymap = {}
     torch_keys = set()
     for key in model_weights.keys():
@@ -74,14 +102,13 @@ def init_keymap(model_weights: dict, mnn_json) -> dict:
                         break
     return keymap
 
-def torch_to_mnn(model, input_shape: Tensor, is_install=False):
-    """Convert torch model to mnn json.
+
+def torch_to_mnn(model, input_shape: Tensor):
+    """Convert torch model to mnn binary.
 
     Args:
         model (Module): Pytorch model to be converted.
         input_shape (Tensor): Shape of input to the model.
-        is_install (bool, optional): Whether need to install 
-            and make MNN to build converter. Defaults to False.
 
     Returns:
         JSON object: MNN model in JSON format.
@@ -90,21 +117,21 @@ def torch_to_mnn(model, input_shape: Tensor, is_install=False):
     input_data = torch.randn(input_shape)
     input_names = ["input"]
     output_names = ["output"]
-    Path("../../cloud/aggregation/cache").mkdir(exist_ok=True)
+    Path(cache_path).mkdir(exist_ok=True)
     torch.onnx.export(
-        model, input_data, "../../cloud/aggregation/cache/model.onnx", verbose=True,
+        model, input_data, f"{cache_path}model.onnx", verbose=True,
         training=torch.onnx.TrainingMode.TRAINING, do_constant_folding=False,
         input_names=input_names, output_names=output_names)
 
-    # ONNX -> MNN -> JSON
-    subprocess.run(["sh", "../../../scripts/convert.sh"])
+    # ONNX -> MNN
+    subprocess.call([
+        f"{script_path}MNNConvert", "-f", "ONNX", "--modelFile",
+        f"{cache_path}model.onnx", "--MNNModel", f"{cache_path}model.mnn", "--forTraining"])
 
-    # load converted JSON file to mnn_json
-    with open('../../cloud/aggregation/cache/model.json') as f:
-        return json.load(f)
-    
+    return Path(f'{cache_path}model.mnn').read_bytes()
 
-def mnn_to_torch(keymap: dict, data):
+
+def mnn_to_torch(keymap: dict, mnn_model_binary: bytes, client_id: str):
     """
     Extract trainable parameters from mnn json.
     Then convert it to state_dict, matching pytorch model.
@@ -114,6 +141,15 @@ def mnn_to_torch(keymap: dict, data):
     Returns:
         dict: Returned the converted state_dict.
     """
+    Path(f'{cache_path}{client_id}.mnn').write_bytes(mnn_model_binary)
+    subprocess.call([
+        f"{script_path}MNNDump2Json",
+        f"{cache_path}{client_id}.mnn",
+        f"{cache_path}{client_id}.json"
+    ])
+    data = json.load(f"{cache_path}{client_id}.json")
+    Path(f'{cache_path}{client_id}.mnn').unlink()
+    Path(f'{cache_path}{client_id}.json').unlink()
     state_dict = {}
     for idx, val in keymap.items():
         key, mnn_type, shape, has_bias = val
