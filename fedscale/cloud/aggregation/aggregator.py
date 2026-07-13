@@ -20,7 +20,7 @@ import fedscale.cloud.logger.aggregator_logging as logger
 from fedscale.cloud.aggregation.optimizers import TorchServerOptimizer
 from fedscale.cloud.channels import job_api_pb2
 from fedscale.cloud.client_manager import ClientManager
-from fedscale.cloud.internal.tensorflow_model_adapter import TensorflowModelAdapter
+#from fedscale.cloud.internal.tensorflow_model_adapter import TensorflowModelAdapter
 from fedscale.cloud.internal.torch_model_adapter import TorchModelAdapter
 from fedscale.cloud.resource_manager import ResourceManager
 from fedscale.cloud.fllibs import *
@@ -198,6 +198,10 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
     def init_model(self):
         """Initialize the model"""
         if self.args.engine == commons.TENSORFLOW:
+            from fedscale.cloud.internal.tensorflow_model_adaptor import (
+               TensorflowModeAdapter,
+            )
+
             self.model_wrapper = TensorflowModelAdapter(init_model())
         elif self.args.engine == commons.PYTORCH:
             self.model_wrapper = TorchModelAdapter(
@@ -642,9 +646,9 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.log_writer.add_scalar(
             "Train/round_duration (min)", self.round_duration / 60.0, self.round
         )
-        self.log_writer.add_histogram(
-            "Train/client_duration (min)", self.flatten_client_duration, self.round
-        )
+       # self.log_writer.add_histogram(
+       #     "Train/client_duration (min)", self.flatten_client_duration, self.round
+       # )
 
         if self.wandb != None:
             self.wandb.log(
@@ -681,16 +685,24 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         )
 
     def save_model(self):
-        """Save model to the wandb server if enabled"""
-        if parser.args.save_checkpoint and self.last_saved_round < self.round:
-            self.last_saved_round = self.round
-            np.save(self.temp_model_path, self.model_weights)
-            if self.wandb != None:
-                artifact = self.wandb.Artifact(
-                    name="model_" + str(self.this_rank), type="model"
-                )
-                artifact.add_file(local_path=self.temp_model_path)
-                self.wandb.log_artifact(artifact)
+        if not getattr(self.args, "save_checkpoint", False):
+            return
+
+        import torch
+
+        checkpoint_path = self.temp_model_path
+        if not checkpoint_path.endswith(".pt"):
+            checkpoint_path += ".pt"
+
+        torch.save(
+            {
+                "model_weights": self.model_weights,
+                "round": self.round,
+            },
+            checkpoint_path,
+        )
+
+        logging.info("Saved model checkpoint to %s", checkpoint_path)
 
     def deserialize_response(self, responses):
         """Deserialize the response from executor
