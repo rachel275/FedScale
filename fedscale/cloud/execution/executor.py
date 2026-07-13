@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import collections
 import gc
+import os
 import pickle
 import random
 import time
@@ -13,13 +14,16 @@ import wandb
 import fedscale.cloud.channels.job_api_pb2 as job_api_pb2
 import fedscale.cloud.logger.executor_logging as logger
 from fedscale.cloud.channels.channel_context import ClientConnections
-from fedscale.cloud.execution.tensorflow_client import TensorflowClient
+#from fedscale.cloud.execution.tensorflow_client import TensorflowClient
 from fedscale.cloud.execution.torch_client import TorchClient
 from fedscale.cloud.execution.data_processor import collate, voice_collate_fn
 from fedscale.cloud.execution.rl_client import RLClient
 from fedscale.cloud.fllibs import *
 from fedscale.dataloaders.divide_data import DataPartitioner, select_dataset
-
+from fedscale.cloud.execution.communication_metrics import (
+    append_communication_record,
+    raw_tensor_bytes,
+)
 
 class Executor(object):
     """Abstract class for FedScale executor.
@@ -42,7 +46,10 @@ class Executor(object):
         # ======== env information ========
         self.this_rank = args.this_rank
         self.executor_id = str(self.this_rank)
-
+        self.communication_log_path = os.path.join(
+            self.args.log_path,
+            f"communication-executor-{self.executor_id}.jsonl",
+        )
         # ======== model and data ========
         self.training_sets = self.test_dataset = None
 
@@ -292,6 +299,7 @@ class Executor(object):
         :return: framework-specific client instance
         """
         if conf.engine == commons.TENSORFLOW:
+            from fedscale.cloud.execution.tensorflow_client import TensorflowClient
             return TensorflowClient(conf)
         elif conf.engine == commons.PYTORCH:
             if conf.task == "rl":
@@ -410,24 +418,67 @@ class Executor(object):
                 current_event = request.event
 
                 if current_event == commons.CLIENT_TRAIN:
+                    serialized_model_bytes = len(request.data)
+                    serialized_metadata_bytes = len(request.meta)
+
                     train_config = self.deserialize_response(request.meta)
                     train_model = self.deserialize_response(request.data)
+
+                    append_communication_record(
+                        self.communication_log_path,
+                        {
+                            "round": self.round,
+                            "executor_id": self.executor_id,
+                            "client_id": int(train_config["client_id"]),
+                            "direction": "download",
+                            "payload_type": "global_model",
+                            "raw_model_bytes": raw_tensor_bytes(train_model),
+                            "serialized_bytes": serialized_model_bytes,
+                            "metadata_bytes": serialized_metadata_bytes,
+                            "method": "full",
+                       },
+                    )
                     train_config["model"] = train_model
                     train_config["client_id"] = int(train_config["client_id"])
                     client_id, train_res = self.Train(train_config)
 
-                    # Upload model updates
-                    future_call = self.aggregator_communicator.stub.CLIENT_EXECUTE_COMPLETION.future(
-                        job_api_pb2.CompleteRequest(
-                            client_id=str(client_id),
-                            executor_id=self.executor_id,
-                            event=commons.UPLOAD_MODEL,
-                            status=True,
-                            msg=None,
-                            meta_result=None,
-                            data_result=self.serialize_response(train_res),
+                    serialized_train_result = self.serialize_response(train_res)
+
+                    update_weights = train_res.get("update_weight", {})
+
+                    append_communication_record(
+                        self.communication_log_path,
+                        {
+                            "round": self.round,
+                            "executor_id": self.executor_id,
+                            "client_id": int(client_id),
+                            "direction": "upload",
+                            "payload_type": "client_training_result",
+                            "raw_update_bytes": raw_tensor_bytes(update_weights),
+                            "serialized_bytes": len(serialized_train_result),
+                            "tensor_count": len(update_weights),
+                            "method": "full",
+                       },
+                    )
+
+                    # Upload model updates.
+                    future_call = (
+                        self.aggregator_communicator.stub
+                        .CLIENT_EXECUTE_COMPLETION
+                        .future(
+                            job_api_pb2.CompleteRequest(
+                                client_id=str(client_id),
+                                executor_id=self.executor_id,
+                                event=commons.UPLOAD_MODEL,
+                                status=True,
+                                msg=None,
+                                meta_result=None,
+                                data_result=serialized_train_result,
+                             )
                         )
                     )
+
+
                     future_call.add_done_callback(
                         lambda _response: self.dispatch_worker_events(
                             _response.result()

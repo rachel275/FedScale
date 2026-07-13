@@ -12,7 +12,7 @@ from fedscale.cloud import commons
 from fedscale.dataloaders.utils_data import get_data_transform
 # FedScale model libs
 from fedscale.utils.models.torch_model_provider import get_cv_model
-from fedscale.utils.models.tensorflow_model_provider import get_tensorflow_model
+#from fedscale.utils.models.tensorflow_model_provider import get_tensorflow_model
 
 tokenizer = None
 
@@ -201,6 +201,10 @@ def init_model():
             model = LinearSVM(parser.args.input_dim, outputClass[parser.args.data_set])
         elif parser.args.model_zoo == "fedscale-tensorflow-zoo":
             assert parser.args.engine == commons.TENSORFLOW
+            from fedscale.utils.models.tensorflow_model_provider import (
+                get_tensorflow_model,
+            )
+
             model = get_tensorflow_model(parser.args.model, parser.args)
         else:
             if parser.args.model_zoo == "fedscale-torch-zoo":
