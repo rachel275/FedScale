@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import collections
 import gc
-import json
 import os
 import pickle
 import random
@@ -71,10 +70,6 @@ class Executor(object):
         self.communication_log_path = os.path.join(
             self.args.log_path,
             f"communication-executor-{self.executor_id}.jsonl",
-        )
-        self.client_update_log_path = os.path.join(
-            self.args.log_path,
-            f"client-update-executor-{self.executor_id}.jsonl",
         )
         # ======== model and data ========
         self.training_sets = self.test_dataset = None
@@ -182,20 +177,14 @@ class Executor(object):
         self.setup_communication()
         self.event_monitor()
 
-    def dispatch_worker_events(self, request, rpc_duration_s=None):
-        """Add new events to worker queues.
+    def dispatch_worker_events(self, request):
+        """Add new events to worker queues
 
-        rpc_duration_s is the application-observed duration of the RPC that
-        returned this response. It includes gRPC/control-plane overhead and,
-        depending on the call, may include server processing or polling wait.
+        Args:
+            request (string): Add grpc request from server (e.g. MODEL_TEST, MODEL_TRAIN) to event_queue.
+
         """
-        self.event_queue.append((request, rpc_duration_s))
-
-    @staticmethod
-    def _append_jsonl(path, record):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as output:
-            output.write(json.dumps(record) + "\n")
+        self.event_queue.append(request)
 
     def deserialize_response(self, responses):
         """Deserialize the response from server
@@ -260,8 +249,7 @@ class Executor(object):
             client_id=client_id, conf=client_conf, model=config["model"]
         )
 
-        # Report execution completion meta information.
-        rpc_start = time.perf_counter()
+        # Report execution completion meta information
         response = self.aggregator_communicator.stub.CLIENT_EXECUTE_COMPLETION(
             job_api_pb2.CompleteRequest(
                 client_id=str(client_id),
@@ -273,11 +261,7 @@ class Executor(object):
                 data_result=None,
             )
         )
-        rpc_duration_s = time.perf_counter() - rpc_start
-        self.dispatch_worker_events(
-            response,
-            rpc_duration_s=rpc_duration_s,
-        )
+        self.dispatch_worker_events(response)
 
         return client_id, train_res
 
@@ -291,9 +275,7 @@ class Executor(object):
         test_res = self.testing_handler(model=config["model"])
         test_res = {"executorId": self.this_rank, "results": test_res}
 
-        # Report execution completion information.
-        serialized_test_result = self.serialize_response(test_res)
-        rpc_start = time.perf_counter()
+        # Report execution completion information
         response = self.aggregator_communicator.stub.CLIENT_EXECUTE_COMPLETION(
             job_api_pb2.CompleteRequest(
                 client_id=self.executor_id,
@@ -302,14 +284,10 @@ class Executor(object):
                 status=True,
                 msg=None,
                 meta_result=None,
-                data_result=serialized_test_result,
+                data_result=self.serialize_response(test_res),
             )
         )
-        rpc_duration_s = time.perf_counter() - rpc_start
-        self.dispatch_worker_events(
-            response,
-            rpc_duration_s=rpc_duration_s,
-        )
+        self.dispatch_worker_events(response)
 
     def Stop(self):
         """Stop the current executor"""
@@ -441,7 +419,6 @@ class Executor(object):
         start_time = time.time()
         while time.time() - start_time < 180:
             try:
-                rpc_start = time.perf_counter()
                 response = self.aggregator_communicator.stub.CLIENT_REGISTER(
                     job_api_pb2.RegisterRequest(
                         client_id=self.executor_id,
@@ -451,11 +428,7 @@ class Executor(object):
                         ),
                     )
                 )
-                rpc_duration_s = time.perf_counter() - rpc_start
-                self.dispatch_worker_events(
-                    response,
-                    rpc_duration_s=rpc_duration_s,
-                )
+                self.dispatch_worker_events(response)
                 break
             except Exception as e:
                 logging.warning(
@@ -464,19 +437,13 @@ class Executor(object):
                 time.sleep(5)
 
     def client_ping(self):
-        """Ping the aggregator for a new task and record observed RPC latency."""
-        rpc_start = time.perf_counter()
+        """Ping the aggregator for new task"""
         response = self.aggregator_communicator.stub.CLIENT_PING(
             job_api_pb2.PingRequest(
-                client_id=self.executor_id,
-                executor_id=self.executor_id,
+                client_id=self.executor_id, executor_id=self.executor_id
             )
         )
-        rpc_duration_s = time.perf_counter() - rpc_start
-        self.dispatch_worker_events(
-            response,
-            rpc_duration_s=rpc_duration_s,
-        )
+        self.dispatch_worker_events(response)
 
     def event_monitor(self):
         """Activate event handler once receiving new message"""
@@ -485,65 +452,36 @@ class Executor(object):
 
         while not self.received_stop_request:
             if len(self.event_queue) > 0:
-                request, response_rpc_duration_s = self.event_queue.popleft()
+                request = self.event_queue.popleft()
                 current_event = request.event
 
                 if current_event == commons.CLIENT_TRAIN:
-                    # End-to-end client update timing starts when the executor
-                    # begins handling the received training task.
-                    client_update_start = time.perf_counter()
-
                     serialized_model_bytes = len(request.data)
                     serialized_metadata_bytes = len(request.meta)
 
                     train_config = self.deserialize_response(request.meta)
                     train_model = self.deserialize_response(request.data)
 
-                    client_id_for_record = int(train_config["client_id"])
-
-                    # The duration attached to this queued response is the
-                    # application-observed duration of the RPC that returned
-                    # the task. This is NOT pure one-way wire time: it may
-                    # include control-plane wait and server processing.
-                    download_duration_s = response_rpc_duration_s
-                    download_effective_mbps = None
-                    if (
-                        download_duration_s is not None
-                        and download_duration_s > 0
-                    ):
-                        download_effective_mbps = (
-                            serialized_model_bytes
-                            * 8
-                            / download_duration_s
-                            / 1_000_000
-                        )
-
                     append_communication_record(
                         self.communication_log_path,
                         {
                             "round": self.round,
                             "executor_id": self.executor_id,
-                            "client_id": client_id_for_record,
+                            "client_id": int(train_config["client_id"]),
                             "direction": "download",
                             "payload_type": "global_model",
                             "raw_model_bytes": raw_tensor_bytes(train_model),
                             "serialized_bytes": serialized_model_bytes,
                             "metadata_bytes": serialized_metadata_bytes,
                             "method": getattr(self.args, "method", "full"),
-                            "transfer_duration_s": download_duration_s,
-                            "throughput_mbps": download_effective_mbps,
-                            "timing_scope": (
-                                "application_rpc_roundtrip_returning_task"
-                            ),
-                        },
+                       },
                     )
-
                     train_config["model"] = train_model
-                    train_config["client_id"] = client_id_for_record
-
+                    train_config["client_id"] = int(train_config["client_id"])
                     client_id, train_res = self.Train(train_config)
 
                     serialized_train_result = self.serialize_response(train_res)
+
                     update_weights = train_res.get("update_weight", {})
 
                     if getattr(self.args, "method", "full") == "topk":
@@ -553,14 +491,26 @@ class Executor(object):
                             for payload in update_weights.values()
                         )
                     else:
-                        raw_update_bytes = raw_tensor_bytes(update_weights)
+                        raw_update_bytes = raw_tensor_bytes(
+                            update_weights
+                        )
 
-                    upload_start = time.perf_counter()
+                    append_communication_record(
+                        self.communication_log_path,
+                        {
+                            "round": self.round,
+                            "executor_id": self.executor_id,
+                            "client_id": int(client_id),
+                            "direction": "upload",
+                            "payload_type": "client_training_result",
+                            "raw_update_bytes": raw_update_bytes,
+                            "serialized_bytes": len(serialized_train_result),
+                            "tensor_count": len(update_weights),
+                            "method": getattr(self.args, "method", "full"),
+                       },
+                    )
 
-                    # Upload model updates asynchronously. Metrics are written
-                    # only when the RPC completes, so upload latency is real
-                    # application-observed completion latency rather than just
-                    # serialization time.
+                    # Upload model updates.
                     future_call = (
                         self.aggregator_communicator.stub
                         .CLIENT_EXECUTE_COMPLETION
@@ -573,113 +523,15 @@ class Executor(object):
                                 msg=None,
                                 meta_result=None,
                                 data_result=serialized_train_result,
-                            )
+                             )
                         )
                     )
 
-                    def _upload_done_callback(
-                        completed_future,
-                        *,
-                        upload_start=upload_start,
-                        client_update_start=client_update_start,
-                        client_id=int(client_id),
-                        round_number=self.round,
-                        serialized_upload_bytes=len(serialized_train_result),
-                        raw_upload_bytes=raw_update_bytes,
-                        tensor_count=len(update_weights),
-                        download_duration_s=download_duration_s,
-                        serialized_download_bytes=serialized_model_bytes,
-                        training_duration_s=float(
-                            train_res.get("real_training_duration_s", 0.0)
-                        ),
-                    ):
-                        upload_duration_s = (
-                            time.perf_counter() - upload_start
-                        )
-                        end_to_end_client_update_s = (
-                            time.perf_counter() - client_update_start
-                        )
-
-                        upload_throughput_mbps = (
-                            serialized_upload_bytes
-                            * 8
-                            / upload_duration_s
-                            / 1_000_000
-                            if upload_duration_s > 0
-                            else None
-                        )
-
-                        append_communication_record(
-                            self.communication_log_path,
-                            {
-                                "round": round_number,
-                                "executor_id": self.executor_id,
-                                "client_id": client_id,
-                                "direction": "upload",
-                                "payload_type": "client_training_result",
-                                "raw_update_bytes": raw_upload_bytes,
-                                "serialized_bytes": serialized_upload_bytes,
-                                "tensor_count": tensor_count,
-                                "method": getattr(
-                                    self.args,
-                                    "method",
-                                    "full",
-                                ),
-                                "transfer_duration_s": upload_duration_s,
-                                "throughput_mbps": upload_throughput_mbps,
-                                "timing_scope": (
-                                    "application_rpc_roundtrip_upload_completion"
-                                ),
-                            },
-                        )
-
-                        self._append_jsonl(
-                            self.client_update_log_path,
-                            {
-                                "timestamp": time.time(),
-                                "round": round_number,
-                                "executor_id": self.executor_id,
-                                "client_id": client_id,
-                                "model": getattr(self.args, "model", ""),
-                                "method": getattr(
-                                    self.args,
-                                    "method",
-                                    "full",
-                                ),
-                                "download_duration_s": download_duration_s,
-                                "real_training_duration_s": training_duration_s,
-                                "upload_duration_s": upload_duration_s,
-                                "end_to_end_client_update_s": (
-                                    end_to_end_client_update_s
-                                ),
-                                "serialized_download_bytes": (
-                                    serialized_download_bytes
-                                ),
-                                "serialized_upload_bytes": (
-                                    serialized_upload_bytes
-                                ),
-                            },
-                        )
-
-                        try:
-                            response = completed_future.result()
-                        except Exception as ex:
-                            logging.warning(
-                                "Upload RPC failed for client %s: %s",
-                                client_id,
-                                ex,
-                            )
-                            return
-
-                        # The returned response may itself contain the next
-                        # task, so preserve the observed RPC duration.
-                        self.dispatch_worker_events(
-                            response,
-                            rpc_duration_s=upload_duration_s,
-                        )
 
                     future_call.add_done_callback(
-                        _upload_done_callback
+                        lambda _response: self.dispatch_worker_events(
+                            _response.result()
+                        )
                     )
 
                 elif current_event == commons.MODEL_TEST:

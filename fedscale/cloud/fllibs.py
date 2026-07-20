@@ -21,15 +21,20 @@ def import_libs():
     global tokenizer
 
     if parser.args.task == 'nlp' or parser.args.task == 'text_clf':
-        global AdamW, AlbertTokenizer, AutoConfig, AutoModelWithLMHead, AutoTokenizer, MobileBertForPreTraining, load_and_cache_examples, mask_tokens
+        global AdamW, AutoConfig, AutoTokenizer, AutoModelForMaskedLM
+        global load_and_cache_examples, mask_tokens
 
-        from transformers import (AdamW, AlbertTokenizer, AutoConfig,
-                                  AutoModelWithLMHead, AutoTokenizer,
-                                  MobileBertForPreTraining)
+        from transformers import (
+            AdamW,
+            AutoConfig,
+            AutoTokenizer,
+            AutoModelForMaskedLM,
+        )
 
-        from fedscale.dataloaders.nlp import load_and_cache_examples, mask_tokens
-        tokenizer = AlbertTokenizer.from_pretrained(
-            'albert-base-v2', do_lower_case=True)
+        from fedscale.dataloaders.nlp import (
+            load_and_cache_examples,
+            mask_tokens,
+        )
     elif parser.args.task == 'speech':
         global numba, SPEECH, BackgroundNoiseDataset, AddBackgroundNoiseOnSTFT, DeleteSTFT, FixSTFTDimension, StretchAudioOnSTFT, TimeshiftAudioOnSTFT, ToMelSpectrogramFromSTFT, ToSTFT, ChangeAmplitude, ChangeSpeedAndPitchAudio, FixAudioLength, LoadAudio, ToMelSpectrogram, ToTensor
 
@@ -99,12 +104,34 @@ def init_model():
     import_libs()
 
     if parser.args.task == 'nlp':
-        config = AutoConfig.from_pretrained(
-            os.path.join(parser.args.data_dir, parser.args.model + '-config.json'))
-        model = AutoModelWithLMHead.from_config(config)
-        tokenizer = AlbertTokenizer.from_pretrained(
-            parser.args.model, do_lower_case=True)
+        from transformers import AutoModelForMaskedLM, AutoTokenizer
 
+        model = AutoModelForMaskedLM.from_pretrained(
+            parser.args.model
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            parser.args.model,
+            use_fast=False,
+        )
+        if parser.args.method == "lora":
+            from peft import LoraConfig, get_peft_model
+
+            if "distilbert" in parser.args.model.lower():
+                target_modules = ["q_lin", "v_lin"]
+            else:
+                target_modules = ["query", "value"]
+
+            lora_config = LoraConfig(
+                r=8,
+                lora_alpha=16,
+                lora_dropout=0.05,
+                bias="none",
+                target_modules=target_modules,
+            )
+
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
         # model_name = 'google/mobilebert-uncased'
         # config = AutoConfig.from_pretrained(model_name)
         # tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
