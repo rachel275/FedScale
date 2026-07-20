@@ -1,6 +1,6 @@
 // GRPC definition for the communication between the aggregator and the executors.
-// After modifying this file, run
-// $ python -m grpc_tools.protoc -I../communication/ --python_out=.. --grpc_python_out=.. job_api.proto
+// After modifying this file, regenerate the Python bindings with grpc_tools.protoc.
+
 syntax = "proto3";
 
 package fedscale;
@@ -9,6 +9,10 @@ service JobService {
     rpc CLIENT_REGISTER (RegisterRequest) returns (ServerResponse) {}
     rpc CLIENT_PING (PingRequest) returns (ServerResponse) {}
     rpc CLIENT_EXECUTE_COMPLETION (CompleteRequest) returns (ServerResponse) {}
+
+    // Large-payload data plane.
+    rpc DOWNLOAD_DATA (TransferRequest) returns (stream DataChunk) {}
+    rpc UPLOAD_DATA (stream DataChunk) returns (UploadReply) {}
 }
 
 message ServerResponse {
@@ -36,4 +40,33 @@ message CompleteRequest {
     string msg = 5;
     string meta_result = 6;
     bytes data_result = 7;
+}
+
+// Request a previously registered large payload.
+message TransferRequest {
+    string transfer_id = 1;
+    string executor_id = 2;
+}
+
+// One chunk of a larger payload.
+message DataChunk {
+    string transfer_id = 1;
+    int64 chunk_index = 2;
+    int64 total_chunks = 3;
+    int64 total_bytes = 4;
+    bytes data = 5;
+
+    // Used for streamed client uploads.
+    string client_id = 6;
+    string executor_id = 7;
+    string event = 8;
+
+}
+
+// Acknowledge a streamed upload.
+message UploadReply {
+    bool success = 1;
+    string transfer_id = 2;
+    string message = 3;
+    ServerResponse response = 4;
 }
