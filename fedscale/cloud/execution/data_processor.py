@@ -1,14 +1,30 @@
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
-from fedscale.cloud.fllibs import *
-
+import fedscale.cloud.fllibs as fllibs
 
 def collate(examples):
-    if tokenizer._pad_token is None:
-        return (pad_sequence(examples, batch_first=True), None)
-    return (pad_sequence(examples, batch_first=True, padding_value=tokenizer.pad_token_id), None)
+    tokenizer = fllibs.tokenizer
 
+    if tokenizer is None:
+        raise RuntimeError(
+            "NLP tokenizer has not been initialized before collate()"
+        )
+
+    if tokenizer._pad_token is None:
+        return (
+            pad_sequence(examples, batch_first=True),
+            None,
+        )
+
+    return (
+        pad_sequence(
+            examples,
+            batch_first=True,
+            padding_value=tokenizer.pad_token_id,
+        ),
+        None,
+    )
 
 def voice_collate_fn(batch):
     def func(p):

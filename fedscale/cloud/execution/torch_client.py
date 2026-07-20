@@ -1,6 +1,11 @@
+import json
 import logging
 import math
+import os
+import resource
 import time
+
+import psutil
 
 import torch
 from torch.autograd import Variable
@@ -46,9 +51,26 @@ class TorchClient(ClientBase):
         :return: training results
         """
         client_id = conf.client_id
+
+        # TorchClient instances may be reused for multiple logical clients.
+        # Reset per-client training statistics before every task.
+        self.epoch_train_loss = 1e-4
+        self.completed_steps = 0
+        self.loss_squared = 0
+
+        train_start = time.perf_counter()
+        rss_start_bytes = self._get_peak_rss_bytes()
+
         logging.info(f"Start to train (CLIENT: {client_id}) ...")
         tokenizer = conf.tokenizer
+        method = getattr(conf, "method", "full")
+        initial_state = None
 
+        if getattr(conf, "method", "full") == "topk":
+            initial_state = {
+                name: tensor.detach().cpu().numpy().copy()
+                for name, tensor in model.state_dict().items()
+            }
         model = model.to(device=self.device)
         model.train()
 
@@ -73,9 +95,54 @@ class TorchClient(ClientBase):
                 error_type = ex
                 break
 
-        state_dicts = model.state_dict()
-        model_param = {p: state_dicts[p].data.cpu().numpy()
-                       for p in state_dicts}
+        if getattr(conf, "method", "full") == "lora":
+            from peft import get_peft_model_state_dict
+
+            state_dicts = get_peft_model_state_dict(model)
+
+            model_param = {
+                name: tensor.detach().cpu().numpy()
+                for name, tensor in state_dicts.items()
+            }
+
+        elif method == "topk":
+
+            from fedscale.cloud.execution.sparsification import (
+                topk_compress,
+            )
+
+            final_state = {
+                name: tensor.detach().cpu().numpy()
+                for name, tensor in model.state_dict().items()
+            }
+
+            delta_state = {
+                name: final_state[name]
+                - initial_state[name]
+                for name in final_state
+            }
+
+            model_param = topk_compress(
+                delta_state,
+               conf.topk_ratio,
+            )
+        else:
+            state_dicts = model.state_dict()
+
+            model_param = {
+                name: tensor.detach().cpu().numpy()
+                for name, tensor in state_dicts.items()
+            }
+
+        real_training_duration_s = time.perf_counter() - train_start
+        memory_stats = self._get_memory_stats(model, optimizer)
+        memory_stats["rss_start_bytes"] = rss_start_bytes
+        memory_stats["peak_rss_bytes"] = self._get_peak_rss_bytes()
+        memory_stats["peak_extra_rss_bytes"] = max(
+            0, memory_stats["peak_rss_bytes"] - rss_start_bytes
+        )
+        memory_stats["system_total_memory_bytes"] = psutil.virtual_memory().total
+
         results = {'client_id': client_id, 'moving_loss': self.epoch_train_loss,
                    'trained_size': self.completed_steps * conf.batch_size,
                    'success': self.completed_steps == conf.local_steps}
@@ -88,9 +155,112 @@ class TorchClient(ClientBase):
         results['utility'] = math.sqrt(
             self.loss_squared) * float(trained_unique_samples)
         results['update_weight'] = model_param
-        results['wall_duration'] = 0
+        results['wall_duration'] = real_training_duration_s
+
+        # Keep scalar metrics in the result for easy downstream summaries.
+        results['real_training_duration_s'] = real_training_duration_s
+        results.update(memory_stats)
+
+        self._write_client_metrics(
+            conf=conf,
+            client_id=client_id,
+            method=method,
+            duration_s=real_training_duration_s,
+            memory_stats=memory_stats,
+            success=results['success'],
+        )
 
         return results
+
+    @staticmethod
+    def _tensor_bytes(tensor):
+        return tensor.numel() * tensor.element_size()
+
+    @staticmethod
+    def _get_peak_rss_bytes():
+        # Linux reports ru_maxrss in KiB. This is the process high-water mark.
+        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
+
+    def _get_memory_stats(self, model, optimizer):
+        model_parameter_bytes = 0
+        trainable_parameter_bytes = 0
+        gradient_bytes = 0
+        optimizer_state_bytes = 0
+
+        for param in model.parameters():
+            size = self._tensor_bytes(param)
+            model_parameter_bytes += size
+
+            if param.requires_grad:
+                trainable_parameter_bytes += size
+
+            if param.grad is not None:
+                gradient_bytes += self._tensor_bytes(param.grad)
+
+        if optimizer is not None:
+            for state in optimizer.state.values():
+                for value in state.values():
+                    if torch.is_tensor(value):
+                        optimizer_state_bytes += self._tensor_bytes(value)
+
+        return {
+            "model_parameter_bytes": model_parameter_bytes,
+            "trainable_parameter_bytes": trainable_parameter_bytes,
+            "gradient_bytes": gradient_bytes,
+            "optimizer_state_bytes": optimizer_state_bytes,
+        }
+
+    def _write_client_metrics(
+        self,
+        conf,
+        client_id,
+        method,
+        duration_s,
+        memory_stats,
+        success,
+    ):
+        results_dir = getattr(conf, "log_path", None) or getattr(
+            self.args, "log_path", "."
+        )
+        os.makedirs(results_dir, exist_ok=True)
+
+        rank = getattr(conf, "rank", None)
+        if rank is None:
+            rank = getattr(conf, "this_rank", None)
+        if rank is None:
+            rank = getattr(self.args, "this_rank", 0)
+
+        record = {
+            "timestamp": time.time(),
+            "run_name": getattr(
+                conf,
+                "job_name",
+                getattr(self.args, "job_name", ""),
+            ),
+            "executor_rank": rank,
+            "client_id": client_id,
+            "round": getattr(conf, "round", getattr(self.args, "round", None)),
+            "method": method,
+            "model": getattr(conf, "model", getattr(self.args, "model", "")),
+            "real_training_duration_s": duration_s,
+            "success": bool(success),
+            **memory_stats,
+        }
+
+        path = os.path.join(
+            results_dir,
+            f"client-metrics-executor-{rank}.jsonl",
+        )
+
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as ex:
+            logging.warning(
+                "Failed to write client metrics to %s: %s",
+                path,
+                ex,
+            )
 
     def get_optimizer(self, model, conf):
         optimizer = None
@@ -145,7 +315,7 @@ class TorchClient(ClientBase):
             if conf.task == 'nlp':
                 (data, _) = data_pair
                 data, target = mask_tokens(
-                    data, tokenizer, conf, device=self.device)
+                    data, conf.tokenizer, conf, device=self.device)
             elif conf.task == 'voice':
                 (data, target, input_percentages,
                  target_sizes), _ = data_pair

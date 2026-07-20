@@ -38,6 +38,33 @@ class TorchModelAdapter(ModelAdapterBase):
             weights = [torch.tensor(x) for x in weights_origin]
             self.optimizer.update_round_gradient(last_grad_weights, weights, self.model, client_training_results)
 
+    def set_lora_weights(self, weights):
+        """Apply a dictionary of LoRA adapter weights to a PEFT model."""
+        from peft import set_peft_model_state_dict
+
+        state_dict = {
+            name: torch.from_numpy(
+                np.asarray(value, dtype=np.float32)
+            )
+            for name, value in weights.items()
+        }
+
+        set_peft_model_state_dict(
+            self.model,
+            state_dict,
+        )
+
+    def get_lora_weights(self):
+        """Return only LoRA adapter weights as a named dictionary."""
+        from peft import get_peft_model_state_dict
+
+        state_dict = get_peft_model_state_dict(self.model)
+
+        return {
+            name: tensor.detach().cpu().numpy()
+            for name, tensor in state_dict.items()
+        }
+
     def get_weights(self) -> List[np.ndarray]:
         """
         Get the model's weights as a numpy weights array. Note that it doesn't contain layer names. Rather, index 0
@@ -45,6 +72,41 @@ class TorchModelAdapter(ModelAdapterBase):
         :return: A numpy array
         """
         return [params.data.clone() for params in self.model.state_dict().values()]
+
+    def apply_delta(self, delta_weights):
+        """Apply an averaged model delta to the current global model."""
+
+        current_state = self.model.state_dict()
+
+        new_state = {}
+
+        for name, tensor in current_state.items():
+
+            if name in delta_weights:
+
+                delta = torch.from_numpy(
+                    np.asarray(
+                        delta_weights[name],
+                        dtype=np.float32,
+                    )
+                ).to(
+                    device=tensor.device,
+                    dtype=tensor.dtype,
+                )
+
+                new_state[name] = (
+                    tensor.detach()
+                    + delta
+                )
+
+            else:
+
+                new_state[name] = tensor
+
+        self.model.load_state_dict(
+            new_state,
+            strict=True,
+        )
 
     def get_model(self):
         """

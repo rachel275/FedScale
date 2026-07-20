@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import collections
 import copy
+import json
 import math
 import os
 import pickle
@@ -97,6 +98,11 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.stats_util_accumulator = []
         self.loss_accumulator = []
         self.client_training_results = []
+
+        self.quality_log_path = os.path.join(
+            self.args.log_path,
+            "quality.jsonl",
+        )
 
         # number of registered executors
         self.registered_executor_info = set()
@@ -195,6 +201,12 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         """For jumbo traffics (e.g., training results)."""
         pass
 
+    def get_model_weights_for_transfer(self):
+        if getattr(self.args, "method", "full") == "lora":
+            return self.model_wrapper.get_lora_weights()
+
+        return self.model_wrapper.get_weights()
+
     def init_model(self):
         """Initialize the model"""
         if self.args.engine == commons.TENSORFLOW:
@@ -248,6 +260,54 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         client_manager = ClientManager(args.sample_mode, args=args)
 
         return client_manager
+
+    def log_model_quality(self, *, round_number, loss,):
+
+        """Record global validation loss and perplexity."""
+
+        try:
+            loss_value = float(loss)
+        except (TypeError, ValueError):
+            return
+
+        # Perplexity is exp(cross-entropy loss).
+        # Protect against numerical overflow.
+        if loss_value < 100:
+            perplexity = math.exp(loss_value)
+        else:
+            perplexity = float("inf")
+
+        record = {
+            "round": int(round_number),
+            "virtual_clock": float(
+                self.global_virtual_clock
+            ),
+            "model": self.args.model,
+            "method": getattr(
+                self.args,
+                "method",
+                "full",
+            ),
+            "topk_ratio": float(
+                getattr(
+                    self.args,
+                    "topk_ratio",
+                    1.0,
+                )
+            ),
+            "validation_loss": loss_value,
+            "perplexity": perplexity,
+        }
+
+        with open(
+            self.quality_log_path,
+            "a",
+            encoding="utf-8",
+        ) as output:
+            output.write(
+                 json.dumps(record)
+                 + "\n"
+            )
 
     def load_client_profile(self, file_path):
         """For Simulation Mode: load client profiles/traces
@@ -491,13 +551,77 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.update_lock.release()
 
     def update_weight_aggregation(self, results):
-        """Updates the aggregation with the new results.
+        """Updates the aggregation with the new results."""
 
-        :param results: the results collected from the client.
-        """
         update_weights = results["update_weight"]
+
+        # LoRA: aggregate adapter weights by parameter name.
+        if getattr(self.args, "method", "full") == "lora":
+            if self._is_first_result_in_round():
+                self.model_weights = {
+                    name: weight.copy()
+                    for name, weight in update_weights.items()
+                }
+            else:
+                for name, weight in update_weights.items():
+                    self.model_weights[name] += weight
+
+            if self._is_last_result_in_round():
+                for name in self.model_weights:
+                    self.model_weights[name] = np.divide(
+                        self.model_weights[name],
+                        self.tasks_round,
+                    )
+
+                self.model_wrapper.set_lora_weights(
+                    copy.deepcopy(self.model_weights)
+                )
+
+            return
+
+        if getattr(self.args, "method", "full") == "topk":
+
+            from fedscale.cloud.execution.sparsification import (
+                topk_decompress,
+            )
+
+            dense_update = topk_decompress(
+                results["update_weight"]
+            )
+
+            if self._is_first_result_in_round():
+
+                self.model_weights = {
+                    name: value.copy()
+                    for name, value
+                    in dense_update.items()
+                }
+
+            else:
+
+                for name, value in dense_update.items():
+
+                     self.model_weights[name] += value
+
+            if self._is_last_result_in_round():
+
+                for name in self.model_weights:
+
+                     self.model_weights[name] = (
+                         self.model_weights[name]
+                        / self.tasks_round
+                    )
+
+                self.model_wrapper.apply_delta(
+                    self.model_weights
+                )
+
+            return
+
+        # Existing full-model aggregation path.
         if type(update_weights) is dict:
             update_weights = [x for x in update_weights.values()]
+
         if self._is_first_result_in_round():
             self.model_weights = update_weights
         else:
@@ -505,14 +629,17 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                 weight + update_weights[i]
                 for i, weight in enumerate(self.model_weights)
             ]
+
         if self._is_last_result_in_round():
             self.model_weights = [
-                np.divide(weight, self.tasks_round) for weight in self.model_weights
+                np.divide(weight, self.tasks_round)
+                for weight in self.model_weights
             ]
+
             self.model_wrapper.set_weights(
                 copy.deepcopy(self.model_weights),
                 client_training_results=self.client_training_results,
-            )
+            ) 
 
     def aggregate_test_result(self):
         accumulator = self.test_result_accumulator[0]
@@ -551,6 +678,11 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             "FL Testing in round: {}, virtual_clock: {}, results: {}".format(
                 self.round, self.global_virtual_clock, round_perf
             )
+        )
+
+        self.log_model_quality(
+            round_number=self.round,
+            loss=round_perf["loss"],
         )
 
     def update_default_task_config(self):
@@ -813,7 +945,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         if next_client_id is not None:
             config = self.get_client_conf(next_client_id)
             train_config = {"client_id": next_client_id, "task_config": config}
-        return train_config, self.model_wrapper.get_weights()
+        return train_config, self.get_model_weights_for_transfer()
 
     def get_test_config(self, client_id):
         """FL model testing on clients, developers can further define personalized client config here.
@@ -825,7 +957,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             dictionary: The testing config for new task.
 
         """
-        return {"client_id": client_id}, self.model_wrapper.get_weights()
+        return {"client_id": client_id}, self.get_model_weights_for_transfer()
 
     def get_shutdown_config(self, client_id):
         """Shutdown config for client, developers can further define personalized client config here.
@@ -912,7 +1044,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             elif current_event == commons.MODEL_TEST:
                 response_msg, response_data = self.get_test_config(client_id)
             elif current_event == commons.UPDATE_MODEL:
-                response_data = self.model_wrapper.get_weights()
+                response_data = self.get_model_weights_for_transfer()
             elif current_event == commons.SHUT_DOWN:
                 response_msg = self.get_shutdown_config(executor_id)
 
