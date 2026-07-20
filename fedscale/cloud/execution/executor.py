@@ -6,6 +6,7 @@ import os
 import pickle
 import random
 import time
+import uuid
 from argparse import Namespace
 
 import numpy as np
@@ -26,6 +27,10 @@ from fedscale.dataloaders.divide_data import DataPartitioner, select_dataset
 from fedscale.cloud.execution.communication_metrics import (
     append_communication_record,
     raw_tensor_bytes,
+)
+from fedscale.cloud.channels.chunked_transfer import (
+    iter_chunks,
+    reassemble_chunks,
 )
 
 class Executor(object):
@@ -220,6 +225,53 @@ class Executor(object):
 
         """
         return pickle.dumps(responses)
+
+    def download_streamed_payload(self, request_data):
+        """Download and reassemble a large payload referenced by request_data."""
+        transfer_info = self.deserialize_response(request_data)
+
+        transfer_id = transfer_info["transfer_id"]
+        expected_serialized_bytes = transfer_info.get("serialized_bytes")
+
+        download_start = time.perf_counter()
+
+        chunk_stream = (
+            self.aggregator_communicator.stub.DOWNLOAD_DATA(
+                job_api_pb2.TransferRequest(
+                    transfer_id=transfer_id,
+                    executor_id=self.executor_id,
+                )
+            )
+        )
+
+        serialized_payload = reassemble_chunks(chunk_stream)
+
+        download_duration_s = time.perf_counter() - download_start
+
+        if (
+            expected_serialized_bytes is not None
+            and len(serialized_payload) != expected_serialized_bytes
+        ):
+            raise RuntimeError(
+                "Downloaded payload size mismatch: "
+                f"expected {expected_serialized_bytes} bytes, "
+                f"got {len(serialized_payload)} bytes"
+            )
+
+        throughput_mbps = (
+            len(serialized_payload)
+            * 8
+            / download_duration_s
+            / 1_000_000
+            if download_duration_s > 0
+            else None
+        )
+
+        return (
+            serialized_payload,
+            download_duration_s,
+            throughput_mbps,
+        )
 
     def set_received_weights(self, weights):
         """Apply full-model or LoRA adapter weights received from aggregator."""
@@ -493,30 +545,29 @@ class Executor(object):
                     # begins handling the received training task.
                     client_update_start = time.perf_counter()
 
-                    serialized_model_bytes = len(request.data)
                     serialized_metadata_bytes = len(request.meta)
 
                     train_config = self.deserialize_response(request.meta)
-                    train_model = self.deserialize_response(request.data)
 
-                    client_id_for_record = int(train_config["client_id"])
+                    (
+                        serialized_train_model,
+                        download_duration_s,
+                        download_effective_mbps,
+                    ) = self.download_streamed_payload(
+                        request.data
+                    )
 
-                    # The duration attached to this queued response is the
-                    # application-observed duration of the RPC that returned
-                    # the task. This is NOT pure one-way wire time: it may
-                    # include control-plane wait and server processing.
-                    download_duration_s = response_rpc_duration_s
-                    download_effective_mbps = None
-                    if (
-                        download_duration_s is not None
-                        and download_duration_s > 0
-                    ):
-                        download_effective_mbps = (
-                            serialized_model_bytes
-                            * 8
-                            / download_duration_s
-                            / 1_000_000
-                        )
+                    train_model = self.deserialize_response(
+                        serialized_train_model
+                    )
+
+                    serialized_model_bytes = len(
+                        serialized_train_model
+                    )
+
+                    client_id_for_record = int(
+                        train_config["client_id"]
+                    )
 
                     append_communication_record(
                         self.communication_log_path,
@@ -533,7 +584,7 @@ class Executor(object):
                             "transfer_duration_s": download_duration_s,
                             "throughput_mbps": download_effective_mbps,
                             "timing_scope": (
-                                "application_rpc_roundtrip_returning_task"
+                                "streamed_model_download"
                             ),
                         },
                     )
@@ -555,25 +606,24 @@ class Executor(object):
                     else:
                         raw_update_bytes = raw_tensor_bytes(update_weights)
 
+                    upload_transfer_id = uuid.uuid4().hex
                     upload_start = time.perf_counter()
 
-                    # Upload model updates asynchronously. Metrics are written
-                    # only when the RPC completes, so upload latency is real
-                    # application-observed completion latency rather than just
-                    # serialization time.
+                    # Stream large client updates in bounded chunks instead of
+                    # placing the entire serialized result in one gRPC message.
+                    upload_chunks = iter_chunks(
+                        serialized_train_result,
+                        upload_transfer_id,
+                        client_id=str(client_id),
+                        executor_id=self.executor_id,
+                        event=commons.UPLOAD_MODEL,
+                    )
+
                     future_call = (
                         self.aggregator_communicator.stub
-                        .CLIENT_EXECUTE_COMPLETION
+                        .UPLOAD_DATA
                         .future(
-                            job_api_pb2.CompleteRequest(
-                                client_id=str(client_id),
-                                executor_id=self.executor_id,
-                                event=commons.UPLOAD_MODEL,
-                                status=True,
-                                msg=None,
-                                meta_result=None,
-                                data_result=serialized_train_result,
-                            )
+                            upload_chunks
                         )
                     )
 
@@ -662,19 +712,27 @@ class Executor(object):
                         )
 
                         try:
-                            response = completed_future.result()
+                            upload_reply = completed_future.result()
                         except Exception as ex:
                             logging.warning(
-                                "Upload RPC failed for client %s: %s",
+                                "Streamed upload RPC failed for client %s: %s",
                                 client_id,
                                 ex,
                             )
                             return
 
-                        # The returned response may itself contain the next
-                        # task, so preserve the observed RPC duration.
+                        if not upload_reply.success:
+                            logging.warning(
+                                "Streamed upload rejected for client %s: %s",
+                                client_id,
+                                upload_reply.message,
+                            )
+                            return
+
+                        # UPLOAD_DATA wraps the normal FedScale ServerResponse
+                        # so the existing event-processing path is preserved.
                         self.dispatch_worker_events(
-                            response,
+                            upload_reply.response,
                             rpc_duration_s=upload_duration_s,
                         )
 
@@ -683,14 +741,106 @@ class Executor(object):
                     )
 
                 elif current_event == commons.MODEL_TEST:
-                    test_config = self.deserialize_response(request.meta)
-                    test_model = self.deserialize_response(request.data)
+                    test_config = self.deserialize_response(
+                        request.meta
+                    )
+
+                    (
+                        serialized_test_model,
+                        test_download_duration_s,
+                        test_download_throughput_mbps,
+                    ) = self.download_streamed_payload(
+                        request.data
+                    )
+
+                    test_model = self.deserialize_response(
+                        serialized_test_model
+                    )
+
                     test_config["model"] = test_model
-                    test_config["client_id"] = int(test_config["client_id"])
+                    test_config["client_id"] = int(
+                        test_config["client_id"]
+                    )
+
+                    append_communication_record(
+                        self.communication_log_path,
+                        {
+                            "round": self.round,
+                            "executor_id": self.executor_id,
+                            "client_id": int(
+                                test_config["client_id"]
+                            ),
+                            "direction": "download",
+                            "payload_type": "test_model",
+                            "raw_model_bytes": raw_tensor_bytes(
+                                test_model
+                            ),
+                            "serialized_bytes": len(
+                                serialized_test_model
+                            ),
+                            "method": getattr(
+                                self.args,
+                                "method",
+                                "full",
+                            ),
+                            "transfer_duration_s": (
+                                test_download_duration_s
+                            ),
+                            "throughput_mbps": (
+                                test_download_throughput_mbps
+                            ),
+                            "timing_scope": (
+                                "streamed_model_download"
+                            ),
+                        },
+                    )
+
                     self.Test(test_config)
 
                 elif current_event == commons.UPDATE_MODEL:
-                    model_weights = self.deserialize_response(request.data)
+                    (
+                        serialized_model_weights,
+                        update_download_duration_s,
+                        update_download_throughput_mbps,
+                    ) = self.download_streamed_payload(
+                        request.data
+                    )
+
+                    model_weights = self.deserialize_response(
+                        serialized_model_weights
+                    )
+
+                    append_communication_record(
+                        self.communication_log_path,
+                        {
+                            "round": self.round,
+                            "executor_id": self.executor_id,
+                            "client_id": None,
+                            "direction": "download",
+                            "payload_type": "global_model_update",
+                            "raw_model_bytes": raw_tensor_bytes(
+                                model_weights
+                            ),
+                            "serialized_bytes": len(
+                                serialized_model_weights
+                            ),
+                            "method": getattr(
+                                self.args,
+                                "method",
+                                "full",
+                            ),
+                            "transfer_duration_s": (
+                                update_download_duration_s
+                            ),
+                            "throughput_mbps": (
+                                update_download_throughput_mbps
+                            ),
+                            "timing_scope": (
+                                "streamed_model_download"
+                            ),
+                        },
+                    )
+
                     self.UpdateModel(model_weights)
 
                 elif current_event == commons.SHUT_DOWN:

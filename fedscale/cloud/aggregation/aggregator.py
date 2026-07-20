@@ -3,6 +3,7 @@ import collections
 import copy
 import json
 import math
+import itertools
 import os
 import pickle
 import random
@@ -13,19 +14,24 @@ from concurrent import futures
 import grpc
 import numpy as np
 import torch
+import uuid
 import wandb
 from torch.utils.tensorboard import SummaryWriter
 
 import fedscale.cloud.channels.job_api_pb2_grpc as job_api_pb2_grpc
 import fedscale.cloud.logger.aggregator_logging as logger
 from fedscale.cloud.aggregation.optimizers import TorchServerOptimizer
-from fedscale.cloud.channels import job_api_pb2
+from fedscale.cloud.channels import job_api_pb2 
 from fedscale.cloud.client_manager import ClientManager
 #from fedscale.cloud.internal.tensorflow_model_adapter import TensorflowModelAdapter
 from fedscale.cloud.internal.torch_model_adapter import TorchModelAdapter
 from fedscale.cloud.resource_manager import ResourceManager
 from fedscale.cloud.fllibs import *
 from torch.utils.tensorboard import SummaryWriter
+from fedscale.cloud.channels.chunked_transfer import (
+    iter_chunks,
+    reassemble_chunks,
+)
 
 MAX_MESSAGE_LENGTH = 1 * 1024 * 1024 * 1024  # 1GB
 
@@ -98,7 +104,8 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.stats_util_accumulator = []
         self.loss_accumulator = []
         self.client_training_results = []
-
+        
+        self.pending_transfers = {}
         self.quality_log_path = os.path.join(
             self.args.log_path,
             "quality.jsonl",
@@ -1016,7 +1023,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         """Handle client ping requests
 
         Args:
-            request (PingRequest): Ping request info from executor.
+            request (PingRequest): Ping t info from executor.
 
         Returns:
             ServerResponse: Server response to ping request
@@ -1024,41 +1031,133 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         """
         # NOTE: client_id = executor_id in deployment,
         # while multiple client_id may use the same executor_id (VMs) in simulations
-        executor_id, client_id = request.executor_id, request.client_id
-        response_data = response_msg = commons.DUMMY_RESPONSE
+    
+        executor_id = request.executor_id
+        client_id = request.client_id
 
-        if len(self.individual_client_events[executor_id]) == 0:
-            # send dummy response
-            current_event = commons.DUMMY_EVENT
-            response_data = response_msg = commons.DUMMY_RESPONSE
-        else:
-            current_event = self.individual_client_events[executor_id].popleft()
-            if current_event == commons.CLIENT_TRAIN:
-                response_msg, response_data = self.create_client_task(executor_id)
-                if response_msg is None:
-                    current_event = commons.DUMMY_EVENT
-                    if self.experiment_mode != commons.SIMULATION_MODE:
-                        self.individual_client_events[executor_id].append(
-                            commons.CLIENT_TRAIN
-                        )
-            elif current_event == commons.MODEL_TEST:
-                response_msg, response_data = self.get_test_config(client_id)
-            elif current_event == commons.UPDATE_MODEL:
-                response_data = self.get_model_weights_for_transfer()
-            elif current_event == commons.SHUT_DOWN:
-                response_msg = self.get_shutdown_config(executor_id)
-
-        response_msg, response_data = self.serialize_response(
+        response_data = (
             response_msg
-        ), self.serialize_response(response_data)
-        # NOTE: in simulation mode, response data is pickle for faster (de)serialization
-        response = job_api_pb2.ServerResponse(
-            event=current_event, meta=response_msg, data=response_data
-        )
-        if current_event != commons.DUMMY_EVENT:
-            logging.info(f"Issue EVENT ({current_event}) to EXECUTOR ({executor_id})")
+        ) = commons.DUMMY_RESPONSE
 
-        return response
+        if (len(self.individual_client_events[executor_id]) == 0):
+
+            current_event = (commons.DUMMY_EVENT)
+
+            response_data = (response_msg) = commons.DUMMY_RESPONSE
+
+        else:
+
+            current_event = (self.individual_client_events[executor_id].popleft())
+
+            if current_event == commons.CLIENT_TRAIN:
+
+                response_msg, response_data = (
+                    self.create_client_task(
+                        executor_id
+                    )
+                )
+
+                if response_msg is None:
+
+                    current_event = (
+                        commons.DUMMY_EVENT
+                    )
+
+                    if (self.experiment_mode != commons.SIMULATION_MODE):
+
+                        self.individual_client_events[executor_id].append(
+                        commons.CLIENT_TRAIN
+                        )
+
+            elif current_event == commons.MODEL_TEST:
+
+                response_msg, response_data = (
+                    self.get_test_config(
+                        client_id
+                    )
+                )
+
+            elif current_event == commons.UPDATE_MODEL:
+
+                response_data = (
+                    self.get_model_weights_for_transfer()
+                )
+
+            elif current_event == commons.SHUT_DOWN:
+
+                response_msg = (
+                    self.get_shutdown_config(
+                        executor_id
+                    )
+                )
+
+
+        serialized_response_msg = (
+            self.serialize_response(
+                response_msg
+            )
+        )
+
+
+        large_payload_events = {
+            commons.CLIENT_TRAIN,
+            commons.MODEL_TEST,
+            commons.UPDATE_MODEL,
+        }
+
+
+        if current_event in large_payload_events:
+
+            serialized_payload = (
+                self.serialize_response(
+                    response_data
+                )
+            )
+
+            transfer_id = (
+                uuid.uuid4().hex
+            )
+
+            self.pending_transfers[transfer_id] = serialized_payload
+
+            transfer_descriptor = {
+                "transfer_id": transfer_id,
+
+                "serialized_bytes": len(serialized_payload),
+            }
+
+            serialized_response_data = (
+                self.serialize_response(
+                    transfer_descriptor
+                )
+            )
+
+        else:
+
+            serialized_response_data = (
+                self.serialize_response(
+                    response_data
+                )
+            )
+
+
+        response = job_api_pb2.ServerResponse(
+            event=current_event,
+            meta=serialized_response_msg,
+            data=serialized_response_data,
+        )
+
+
+        if current_event != commons.DUMMY_EVENT:
+
+            logging.info(
+                "Issue EVENT (%s) to EXECUTOR (%s)",
+                current_event,
+                executor_id,
+            )
+
+
+        return response 
 
     def CLIENT_EXECUTE_COMPLETION(self, request, context):
         """FL clients complete the execution task.
@@ -1105,6 +1204,124 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             logging.error(f"Received undefined event {event} from client {client_id}")
 
         return self.CLIENT_PING(request, context)
+
+    def DOWNLOAD_DATA(self, request, context):
+        transfer_id = request.transfer_id
+
+        payload = self.pending_transfers.get(
+            transfer_id
+        )
+
+        if payload is None:
+            context.abort(
+                grpc.StatusCode.NOT_FOUND,
+                f"Unknown transfer_id: {transfer_id}",
+            )
+
+        try:
+            yield from iter_chunks(
+                payload,
+                transfer_id,
+            )
+
+        finally:
+            self.pending_transfers.pop(
+                transfer_id,
+                None,
+            )
+
+    def UPLOAD_DATA(
+    self,
+    request_iterator,
+    context,
+    ):
+        iterator = iter(
+            request_iterator
+        )
+
+        try:
+            first_chunk = next(
+                iterator
+            )
+
+        except StopIteration:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "Received empty upload stream",
+            )
+
+        transfer_id = (
+            first_chunk.transfer_id
+        )
+
+        client_id = (
+             first_chunk.client_id
+        )
+
+        executor_id = (
+            first_chunk.executor_id
+        )
+
+        event = (
+            first_chunk.event
+        )
+
+        # Put the first chunk back in front of
+        # the remaining iterator.
+        complete_stream = itertools.chain(
+            [first_chunk],
+            iterator,
+        )
+
+        try:
+            payload = reassemble_chunks(
+                complete_stream
+            )
+
+        except Exception as ex:
+            context.abort(
+                grpc.StatusCode.DATA_LOSS,
+                f"Failed to reassemble "
+                f"transfer {transfer_id}: {ex}",
+            )
+
+        logging.info(
+            "Received streamed upload "
+            "transfer_id=%s client=%s "
+            "executor=%s bytes=%d",
+            transfer_id,
+            client_id,
+            executor_id,
+            len(payload),
+        )
+
+        # Reuse the existing FedScale completion
+        # handler instead of duplicating its logic.
+        completion_request = (
+            job_api_pb2.CompleteRequest(
+                client_id=client_id,
+                executor_id=executor_id,
+                event=event,
+                status=True,
+                msg="",
+                meta_result="",
+                data_result=payload,
+            )
+        )
+
+        server_response = (
+            self.CLIENT_EXECUTE_COMPLETION(
+                completion_request,
+                context,
+            )
+        )
+
+        return job_api_pb2.UploadReply(
+            success=True,
+            transfer_id=transfer_id,
+            message="Upload completed",
+            response=server_response,
+        )
 
     def event_monitor(self):
         """Activate event handler according to the received new message"""
