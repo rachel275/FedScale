@@ -32,6 +32,10 @@ from fedscale.cloud.channels.chunked_transfer import (
     iter_chunks,
     reassemble_chunks,
 )
+from fedscale.cloud.execution.sparsification import (
+    topk_compress,
+    topk_decompress,
+)
 
 MAX_MESSAGE_LENGTH = 1 * 1024 * 1024 * 1024  # 1GB
 
@@ -66,6 +70,13 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.update_lock = threading.Lock()
         # all weights including bias/#_batch_tracked (e.g., state_dict)
         self.model_weights = None
+        # Bidirectional Top-K state.
+        #
+        # Executors receive a full model once, then sparse global-model deltas
+        # on subsequent rounds.
+        self.topk_previous_global_state = None
+        self.topk_downlink_payload = None
+        self.topk_has_initial_sync = False
         self.temp_model_path = os.path.join(
             logger.logDir, "model_" + str(args.this_rank) + ".npy"
         )
@@ -208,9 +219,43 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         """For jumbo traffics (e.g., training results)."""
         pass
 
+    def get_named_global_state(self):
+        """Return the current global PyTorch state as named NumPy arrays."""
+
+        model = self.model_wrapper.get_model()
+
+        return {
+            name: tensor.detach().cpu().numpy().copy()
+            for name, tensor in model.state_dict().items()
+        }
+
     def get_model_weights_for_transfer(self):
-        if getattr(self.args, "method", "full") == "lora":
+        method = getattr(
+            self.args,
+            "method",
+            "full",
+        )
+
+        if method == "lora":
             return self.model_wrapper.get_lora_weights()
+
+        if method == "topk":
+            # First transfer must be dense so the executor has a
+            # known base model for future sparse deltas.
+            if not self.topk_has_initial_sync:
+                return {
+                    "type": "topk_full",
+                    "round": self.round,
+                    "weights": self.get_named_global_state(),
+                }
+
+            # Subsequent transfers use the sparse global delta.
+            return {
+                "type": "topk_delta",
+                "base_round": self.round - 1,
+                "target_round": self.round,
+                "update": self.topk_downlink_payload,
+            }
 
         return self.model_wrapper.get_weights()
 
@@ -588,42 +633,73 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
         if getattr(self.args, "method", "full") == "topk":
 
-            from fedscale.cloud.execution.sparsification import (
-                topk_decompress,
-            )
-
             dense_update = topk_decompress(
                 results["update_weight"]
             )
 
             if self._is_first_result_in_round():
 
+                # Save the global model before applying this round's
+                # aggregated client update.
+                self.topk_previous_global_state = (
+                    self.get_named_global_state()
+                )
+
                 self.model_weights = {
                     name: value.copy()
-                    for name, value
-                    in dense_update.items()
+                    for name, value in dense_update.items()
                 }
 
             else:
 
                 for name, value in dense_update.items():
-
-                     self.model_weights[name] += value
+                    self.model_weights[name] += value
 
             if self._is_last_result_in_round():
 
+                # Average client deltas.
                 for name in self.model_weights:
-
-                     self.model_weights[name] = (
-                         self.model_weights[name]
+                    self.model_weights[name] = (
+                        self.model_weights[name]
                         / self.tasks_round
                     )
 
+                # Apply averaged client delta to the true global model.
                 self.model_wrapper.apply_delta(
                     self.model_weights
                 )
 
+                # Read back the newly updated global model.
+                new_global_state = (
+                    self.get_named_global_state()
+                )
+
+                # Compute the server-side global delta:
+                #
+                #     W_new - W_previous
+                #
+                global_delta = {
+                    name: (
+                        new_global_state[name]
+                        - self.topk_previous_global_state[name]
+                    )
+                    for name in new_global_state
+                }
+
+                # Compress this global-model delta for the next downlink.
+                self.topk_downlink_payload = (
+                    topk_compress(
+                        global_delta,
+                        self.args.topk_ratio,
+                    )
+                )
+
+                # Executors have received/are about to receive an initial
+                # full model, so subsequent model transfers may use deltas.
+                self.topk_has_initial_sync = True
+
             return
+
 
         # Existing full-model aggregation path.
         if type(update_weights) is dict:
@@ -952,7 +1028,9 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         if next_client_id is not None:
             config = self.get_client_conf(next_client_id)
             train_config = {"client_id": next_client_id, "task_config": config}
-        return train_config, self.get_model_weights_for_transfer()
+
+        return train_config, None
+
 
     def get_test_config(self, client_id):
         """FL model testing on clients, developers can further define personalized client config here.
@@ -1098,13 +1176,10 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             )
         )
 
-
         large_payload_events = {
-            commons.CLIENT_TRAIN,
             commons.MODEL_TEST,
             commons.UPDATE_MODEL,
         }
-
 
         if current_event in large_payload_events:
 

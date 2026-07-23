@@ -20,23 +20,65 @@ class TorchModelAdapter(ModelAdapterBase):
         self.model = model
         self.optimizer = optimizer
 
-    def set_weights(self, weights: List[np.ndarray], is_aggregator=True, client_training_results=None):
+    def set_weights(
+        self,
+        weights,
+        is_aggregator=True,
+        client_training_results=None,
+    ):
         """
-        Set the model's weights to the numpy weights array.
-        :param weights: numpy weights array
-        :param is_aggregator: boolean indicating whether the caller is the aggregator
-        :param client_training_results: list of gradients from every clients, for q-fedavg
+        Set model weights.
+
+        Supports:
+        - Standard FedScale full-model weights as an ordered list.
+        - LoRA/PEFT adapter weights as a name-keyed dictionary.
         """
-        last_grad_weights = [param.data.clone() for param in self.model.state_dict().values()]
+
+        # LoRA weights are transmitted as a dictionary keyed by parameter name.
+        if isinstance(weights, dict):
+            self.set_lora_weights(weights)
+            return
+
+        # Standard FedScale full-model behaviour.
+        last_grad_weights = [
+            param.data.clone()
+            for param in self.model.state_dict().values()
+        ]
+
+        if len(weights) != len(self.model.state_dict()):
+            raise ValueError(
+                f"Received {len(weights)} weights, but model state_dict "
+                f"contains {len(self.model.state_dict())} entries."
+            )
+
         new_state_dict = {
-            name: torch.from_numpy(np.asarray(weights[i], dtype=np.float32))
-            for i, name in enumerate(self.model.state_dict().keys())
+            name: torch.from_numpy(
+                np.asarray(weights[i], dtype=np.float32)
+            ).to(
+                device=tensor.device,
+                dtype=tensor.dtype,
+            )
+            for i, (name, tensor) in enumerate(
+                self.model.state_dict().items()
+            )
         }
+
         self.model.load_state_dict(new_state_dict)
+
         if self.optimizer and is_aggregator:
             weights_origin = copy.deepcopy(weights)
-            weights = [torch.tensor(x) for x in weights_origin]
-            self.optimizer.update_round_gradient(last_grad_weights, weights, self.model, client_training_results)
+
+            tensor_weights = [
+                torch.tensor(x)
+                for x in weights_origin
+            ]
+
+            self.optimizer.update_round_gradient(
+                last_grad_weights,
+                tensor_weights,
+                self.model,
+                client_training_results,
+            )
 
     def set_lora_weights(self, weights):
         """Apply a dictionary of LoRA adapter weights to a PEFT model."""

@@ -21,7 +21,8 @@ def import_libs():
     global tokenizer
 
     if parser.args.task == 'nlp' or parser.args.task == 'text_clf':
-        global AdamW, AutoConfig, AutoTokenizer, AutoModelForMaskedLM
+        global AdamW, AutoConfig, AutoTokenizer
+        global AutoModelForMaskedLM, AutoModelForCausalLM
         global load_and_cache_examples, mask_tokens
 
         from transformers import (
@@ -29,6 +30,7 @@ def import_libs():
             AutoConfig,
             AutoTokenizer,
             AutoModelForMaskedLM,
+            AutoModelForCausalLM,
         )
 
         from fedscale.dataloaders.nlp import (
@@ -103,41 +105,110 @@ def init_model():
 
     import_libs()
 
-    if parser.args.task == 'nlp':
-        from transformers import AutoModelForMaskedLM, AutoTokenizer
+    if parser.args.task == "nlp":
+        from transformers import (
+            AutoModelForMaskedLM,
+            AutoModelForCausalLM,
+            AutoTokenizer,
+        )
 
-        model = AutoModelForMaskedLM.from_pretrained(
-            parser.args.model
+        model_name = parser.args.model
+        model_name_lower = model_name.lower()
+
+        # Decoder-only / causal language models.
+        is_causal_lm = any(
+            name in model_name_lower
+            for name in (
+                "llama",
+                "qwen",
+                "mistral",
+                "gemma",
+            )
         )
 
         tokenizer = AutoTokenizer.from_pretrained(
-            parser.args.model,
+            model_name,
             use_fast=False,
         )
-        if parser.args.method == "lora":
-            from peft import LoraConfig, get_peft_model
 
-            if "distilbert" in parser.args.model.lower():
-                target_modules = ["q_lin", "v_lin"]
-            else:
-                target_modules = ["query", "value"]
-
-            lora_config = LoraConfig(
-                r=8,
-                lora_alpha=16,
-                lora_dropout=0.05,
-                bias="none",
-                target_modules=target_modules,
+        if is_causal_lm:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name
             )
 
-            model = get_peft_model(model, lora_config)
-            model.print_trainable_parameters()
-        # model_name = 'google/mobilebert-uncased'
-        # config = AutoConfig.from_pretrained(model_name)
-        # tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        # model = MobileBertForPreTraining.from_pretrained(model_name)
-        # model = AutoModelWithLMHead.from_config(config)
+            # Many decoder-only models, including Llama,
+            # do not define a padding token by default.
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
 
+            model.config.pad_token_id = (
+                tokenizer.pad_token_id
+            )
+
+        else:
+            model = AutoModelForMaskedLM.from_pretrained(
+                model_name
+            )
+
+        if parser.args.method == "lora":
+            from peft import (
+                LoraConfig,
+                get_peft_model,
+            )
+
+            if "distilbert" in model_name_lower:
+                target_modules = [
+                    "q_lin",
+                    "v_lin",
+                ]
+
+            elif is_causal_lm:
+                # Llama/Qwen-style attention projection names.
+                target_modules = [
+                    "q_proj",
+                    "v_proj",
+                ]
+
+            else:
+                # BERT/ALBERT-style attention modules.
+                target_modules = [
+                    "query",
+                    "value",
+                ]
+
+            from peft import TaskType
+
+            if is_causal_lm:
+                peft_task_type = TaskType.CAUSAL_LM
+            else:
+                peft_task_type = TaskType.FEATURE_EXTRACTION
+
+            lora_kwargs = {
+                "r": 8,
+                "lora_alpha": 16,
+                "lora_dropout": 0.05,
+                "bias": "none",
+                "target_modules": target_modules,
+            }
+
+            if is_causal_lm:
+                from peft import TaskType
+
+                lora_kwargs["task_type"] = (
+                    TaskType.CAUSAL_LM
+                )
+
+            lora_config = LoraConfig(
+                **lora_kwargs
+            )
+
+            model = get_peft_model(
+                model,
+                lora_config,
+            )
+
+            model.print_trainable_parameters()
+            
     elif parser.args.task == 'text_clf':
 
         if parser.args.model == 'albert':

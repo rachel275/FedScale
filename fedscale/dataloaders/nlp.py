@@ -89,8 +89,15 @@ class TextDataset(Dataset):
             (tokenizer.model_max_length - tokenizer.max_len_single_sentence)
 
         directory = file_path
+        # cached_features_file = os.path.join(
+        #     directory, args.model + "_cached_lm_" + str(block_size)
+        # )
+
+        model_cache_name = args.model.replace("/", "_")
+
         cached_features_file = os.path.join(
-            directory, args.model + "_cached_lm_" + str(block_size)
+            directory,
+            model_cache_name + "_cached_lm_" + str(block_size),
         )
 
         if os.path.exists(cached_features_file) and not args.overwrite_cache:
