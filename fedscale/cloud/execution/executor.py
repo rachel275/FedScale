@@ -28,6 +28,9 @@ from fedscale.cloud.execution.communication_metrics import (
     append_communication_record,
     raw_tensor_bytes,
 )
+from fedscale.cloud.execution.sparsification import (
+    apply_topk_delta,
+)
 from fedscale.cloud.channels.chunked_transfer import (
     iter_chunks,
     reassemble_chunks,
@@ -86,6 +89,9 @@ class Executor(object):
 
         # ======== channels ========
         self.aggregator_communicator = ClientConnections(args.ps_ip, args.ps_port)
+
+        self.last_model_download_duration_s = None
+        self.last_model_download_bytes = 0
 
         # ======== runtime information ========
         self.collate_fn = None
@@ -283,6 +289,93 @@ class Executor(object):
                 is_aggregator=False,
             )
 
+    def apply_topk_full_model(self, payload):
+        """Install the initial dense named model state for Top-K."""
+
+        named_weights = payload["weights"]
+
+        model = self.model_adapter.get_model()
+
+        current_state = model.state_dict()
+
+        new_state = {}
+
+        for name, tensor in current_state.items():
+
+            if name not in named_weights:
+                new_state[name] = tensor
+                continue
+
+            value = np.asarray(
+                named_weights[name]
+            )
+
+            new_state[name] = torch.from_numpy(
+                value
+            ).to(
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+
+        model.load_state_dict(
+            new_state,
+            strict=False,
+        )
+
+        self.round = int(
+            payload.get(
+                "round",
+                self.round + 1,
+            )
+        )
+
+
+    def apply_topk_model_delta(self, payload):
+        """Apply a sparse Top-K global-model delta."""
+
+        model = self.model_adapter.get_model()
+
+        current_state = {
+            name: tensor.detach()
+            .cpu()
+            .numpy()
+            .copy()
+            for name, tensor
+            in model.state_dict().items()
+        }
+
+        updated_state = apply_topk_delta(
+            current_state,
+            payload["update"],
+        )
+
+        torch_state = {}
+
+        existing_state = model.state_dict()
+
+        for name, array in updated_state.items():
+
+            reference = existing_state[name]
+
+            torch_state[name] = torch.from_numpy(
+                np.asarray(array)
+            ).to(
+                dtype=reference.dtype,
+                device=reference.device,
+            )
+
+        model.load_state_dict(
+            torch_state,
+            strict=False,
+        )
+
+        self.round = int(
+            payload.get(
+                "target_round",
+                self.round + 1,
+            )
+        )
+
     def UpdateModel(self, model_weights):
         """Receive the broadcasted global model for current round
 
@@ -305,11 +398,10 @@ class Executor(object):
         """
         client_id, train_config = config["client_id"], config["task_config"]
 
-        if "model" not in config or not config["model"]:
-            raise "The 'model' object must be a non-null value in the training config."
         client_conf = self.override_conf(train_config)
         train_res = self.training_handler(
-            client_id=client_id, conf=client_conf, model=config["model"]
+            client_id=client_id,
+            conf=client_conf,
         )
 
         # Report execution completion meta information.
@@ -411,9 +503,11 @@ class Executor(object):
                 return RLClient(conf)
             else:
                 return TorchClient(conf)
-        raise "Currently, FedScale supports tensorflow and pytorch."
+        raise ValueError(
+            "Currently, FedScale supports TensorFlow and PyTorch."
+        )
 
-    def training_handler(self, client_id, conf, model):
+    def training_handler(self, client_id, conf):
         """Train model given client id
 
         Args:
@@ -424,8 +518,10 @@ class Executor(object):
             dictionary: The train result
 
         """
-        self.set_received_weights(model) #, is_aggregator=False)
+        # UPDATE_MODEL has already installed the current global model.
+        # Train directly from the executor's cached model.
         conf.client_id = client_id
+        conf.round = self.round
         conf.tokenizer = fllibs.tokenizer
         client_data = (
             self.training_sets
@@ -453,16 +549,8 @@ class Executor(object):
         return train_res
 
     def testing_handler(self, model):
-        """Test model
+        """Test the model already installed by UPDATE_MODEL."""
 
-        Args:
-            args (dictionary): Variable arguments for fedscale runtime config. defaults to the setup in arg_parser.py
-            config (dictionary): Variable arguments from coordinator.
-        Returns:
-            dictionary: The test result
-
-        """
-        self.set_received_weights(model) #, is_aggregator=False)
         test_config = self.override_conf(
             {
                 "rank": self.this_rank,
@@ -470,7 +558,11 @@ class Executor(object):
                 "tokenizer": fllibs.tokenizer,
             }
         )
-        client = self.get_client_trainer(test_config)
+
+        client = self.get_client_trainer(
+            test_config
+        )
+
         data_loader = select_dataset(
             self.this_rank,
             self.testing_sets,
@@ -481,9 +573,15 @@ class Executor(object):
         )
 
         test_results = client.test(
-            data_loader, model=self.model_adapter.get_model(), conf=test_config
+            data_loader,
+            model=self.model_adapter.get_model(),
+            conf=test_config,
         )
-        self.log_test_result(test_results)
+
+        self.log_test_result(
+            test_results
+        )
+
         gc.collect()
 
         return test_results
@@ -536,319 +634,7 @@ class Executor(object):
         self.client_register()
 
         while not self.received_stop_request:
-            if len(self.event_queue) > 0:
-                request, response_rpc_duration_s = self.event_queue.popleft()
-                current_event = request.event
-
-                if current_event == commons.CLIENT_TRAIN:
-                    # End-to-end client update timing starts when the executor
-                    # begins handling the received training task.
-                    client_update_start = time.perf_counter()
-
-                    serialized_metadata_bytes = len(request.meta)
-
-                    train_config = self.deserialize_response(request.meta)
-
-                    (
-                        serialized_train_model,
-                        download_duration_s,
-                        download_effective_mbps,
-                    ) = self.download_streamed_payload(
-                        request.data
-                    )
-
-                    train_model = self.deserialize_response(
-                        serialized_train_model
-                    )
-
-                    serialized_model_bytes = len(
-                        serialized_train_model
-                    )
-
-                    client_id_for_record = int(
-                        train_config["client_id"]
-                    )
-
-                    append_communication_record(
-                        self.communication_log_path,
-                        {
-                            "round": self.round,
-                            "executor_id": self.executor_id,
-                            "client_id": client_id_for_record,
-                            "direction": "download",
-                            "payload_type": "global_model",
-                            "raw_model_bytes": raw_tensor_bytes(train_model),
-                            "serialized_bytes": serialized_model_bytes,
-                            "metadata_bytes": serialized_metadata_bytes,
-                            "method": getattr(self.args, "method", "full"),
-                            "transfer_duration_s": download_duration_s,
-                            "throughput_mbps": download_effective_mbps,
-                            "timing_scope": (
-                                "streamed_model_download"
-                            ),
-                        },
-                    )
-
-                    train_config["model"] = train_model
-                    train_config["client_id"] = client_id_for_record
-
-                    client_id, train_res = self.Train(train_config)
-
-                    serialized_train_result = self.serialize_response(train_res)
-                    update_weights = train_res.get("update_weight", {})
-
-                    if getattr(self.args, "method", "full") == "topk":
-                        raw_update_bytes = sum(
-                            payload["indices"].nbytes
-                            + payload["values"].nbytes
-                            for payload in update_weights.values()
-                        )
-                    else:
-                        raw_update_bytes = raw_tensor_bytes(update_weights)
-
-                    upload_transfer_id = uuid.uuid4().hex
-                    upload_start = time.perf_counter()
-
-                    # Stream large client updates in bounded chunks instead of
-                    # placing the entire serialized result in one gRPC message.
-                    upload_chunks = iter_chunks(
-                        serialized_train_result,
-                        upload_transfer_id,
-                        client_id=str(client_id),
-                        executor_id=self.executor_id,
-                        event=commons.UPLOAD_MODEL,
-                    )
-
-                    future_call = (
-                        self.aggregator_communicator.stub
-                        .UPLOAD_DATA
-                        .future(
-                            upload_chunks
-                        )
-                    )
-
-                    def _upload_done_callback(
-                        completed_future,
-                        *,
-                        upload_start=upload_start,
-                        client_update_start=client_update_start,
-                        client_id=int(client_id),
-                        round_number=self.round,
-                        serialized_upload_bytes=len(serialized_train_result),
-                        raw_upload_bytes=raw_update_bytes,
-                        tensor_count=len(update_weights),
-                        download_duration_s=download_duration_s,
-                        serialized_download_bytes=serialized_model_bytes,
-                        training_duration_s=float(
-                            train_res.get("real_training_duration_s", 0.0)
-                        ),
-                    ):
-                        upload_duration_s = (
-                            time.perf_counter() - upload_start
-                        )
-                        end_to_end_client_update_s = (
-                            time.perf_counter() - client_update_start
-                        )
-
-                        upload_throughput_mbps = (
-                            serialized_upload_bytes
-                            * 8
-                            / upload_duration_s
-                            / 1_000_000
-                            if upload_duration_s > 0
-                            else None
-                        )
-
-                        append_communication_record(
-                            self.communication_log_path,
-                            {
-                                "round": round_number,
-                                "executor_id": self.executor_id,
-                                "client_id": client_id,
-                                "direction": "upload",
-                                "payload_type": "client_training_result",
-                                "raw_update_bytes": raw_upload_bytes,
-                                "serialized_bytes": serialized_upload_bytes,
-                                "tensor_count": tensor_count,
-                                "method": getattr(
-                                    self.args,
-                                    "method",
-                                    "full",
-                                ),
-                                "transfer_duration_s": upload_duration_s,
-                                "throughput_mbps": upload_throughput_mbps,
-                                "timing_scope": (
-                                    "application_rpc_roundtrip_upload_completion"
-                                ),
-                            },
-                        )
-
-                        self._append_jsonl(
-                            self.client_update_log_path,
-                            {
-                                "timestamp": time.time(),
-                                "round": round_number,
-                                "executor_id": self.executor_id,
-                                "client_id": client_id,
-                                "model": getattr(self.args, "model", ""),
-                                "method": getattr(
-                                    self.args,
-                                    "method",
-                                    "full",
-                                ),
-                                "download_duration_s": download_duration_s,
-                                "real_training_duration_s": training_duration_s,
-                                "upload_duration_s": upload_duration_s,
-                                "end_to_end_client_update_s": (
-                                    end_to_end_client_update_s
-                                ),
-                                "serialized_download_bytes": (
-                                    serialized_download_bytes
-                                ),
-                                "serialized_upload_bytes": (
-                                    serialized_upload_bytes
-                                ),
-                            },
-                        )
-
-                        try:
-                            upload_reply = completed_future.result()
-                        except Exception as ex:
-                            logging.warning(
-                                "Streamed upload RPC failed for client %s: %s",
-                                client_id,
-                                ex,
-                            )
-                            return
-
-                        if not upload_reply.success:
-                            logging.warning(
-                                "Streamed upload rejected for client %s: %s",
-                                client_id,
-                                upload_reply.message,
-                            )
-                            return
-
-                        # UPLOAD_DATA wraps the normal FedScale ServerResponse
-                        # so the existing event-processing path is preserved.
-                        self.dispatch_worker_events(
-                            upload_reply.response,
-                            rpc_duration_s=upload_duration_s,
-                        )
-
-                    future_call.add_done_callback(
-                        _upload_done_callback
-                    )
-
-                elif current_event == commons.MODEL_TEST:
-                    test_config = self.deserialize_response(
-                        request.meta
-                    )
-
-                    (
-                        serialized_test_model,
-                        test_download_duration_s,
-                        test_download_throughput_mbps,
-                    ) = self.download_streamed_payload(
-                        request.data
-                    )
-
-                    test_model = self.deserialize_response(
-                        serialized_test_model
-                    )
-
-                    test_config["model"] = test_model
-                    test_config["client_id"] = int(
-                        test_config["client_id"]
-                    )
-
-                    append_communication_record(
-                        self.communication_log_path,
-                        {
-                            "round": self.round,
-                            "executor_id": self.executor_id,
-                            "client_id": int(
-                                test_config["client_id"]
-                            ),
-                            "direction": "download",
-                            "payload_type": "test_model",
-                            "raw_model_bytes": raw_tensor_bytes(
-                                test_model
-                            ),
-                            "serialized_bytes": len(
-                                serialized_test_model
-                            ),
-                            "method": getattr(
-                                self.args,
-                                "method",
-                                "full",
-                            ),
-                            "transfer_duration_s": (
-                                test_download_duration_s
-                            ),
-                            "throughput_mbps": (
-                                test_download_throughput_mbps
-                            ),
-                            "timing_scope": (
-                                "streamed_model_download"
-                            ),
-                        },
-                    )
-
-                    self.Test(test_config)
-
-                elif current_event == commons.UPDATE_MODEL:
-                    (
-                        serialized_model_weights,
-                        update_download_duration_s,
-                        update_download_throughput_mbps,
-                    ) = self.download_streamed_payload(
-                        request.data
-                    )
-
-                    model_weights = self.deserialize_response(
-                        serialized_model_weights
-                    )
-
-                    append_communication_record(
-                        self.communication_log_path,
-                        {
-                            "round": self.round,
-                            "executor_id": self.executor_id,
-                            "client_id": None,
-                            "direction": "download",
-                            "payload_type": "global_model_update",
-                            "raw_model_bytes": raw_tensor_bytes(
-                                model_weights
-                            ),
-                            "serialized_bytes": len(
-                                serialized_model_weights
-                            ),
-                            "method": getattr(
-                                self.args,
-                                "method",
-                                "full",
-                            ),
-                            "transfer_duration_s": (
-                                update_download_duration_s
-                            ),
-                            "throughput_mbps": (
-                                update_download_throughput_mbps
-                            ),
-                            "timing_scope": (
-                                "streamed_model_download"
-                            ),
-                        },
-                    )
-
-                    self.UpdateModel(model_weights)
-
-                elif current_event == commons.SHUT_DOWN:
-                    self.Stop()
-
-                elif current_event == commons.DUMMY_EVENT:
-                    pass
-            else:
+            if len(self.event_queue) == 0:
                 time.sleep(1)
                 try:
                     self.client_ping()
@@ -857,6 +643,339 @@ class Executor(object):
                         f"Caught exception {e} from aggregator, terminating executor {self.this_rank} ..."
                     )
                     self.Stop()
+                continue
+
+            request, response_rpc_duration_s = self.event_queue.popleft()
+            current_event = request.event
+
+            if current_event == commons.CLIENT_TRAIN:
+                # End-to-end client update timing starts when the executor
+                # begins handling the received training task.
+                client_update_start = time.perf_counter()
+
+                train_config = self.deserialize_response(
+                    request.meta
+                )
+
+                client_id_for_record = int(
+                    train_config["client_id"]
+                )
+
+                # UPDATE_MODEL has already installed the current model.
+                # CLIENT_TRAIN carries only metadata/configuration.
+
+                train_config["client_id"] = (
+                    client_id_for_record
+                )
+
+                client_id, train_res = self.Train(
+                    train_config
+                )
+
+                serialized_train_result = self.serialize_response(
+                    train_res
+                )
+
+                update_weights = train_res.get(
+                    "update_weight",
+                    {},
+                )
+
+                if getattr(
+                    self.args,
+                    "method",
+                    "full",
+                ) == "topk":
+
+                    raw_update_bytes = sum(
+                        payload["indices"].nbytes
+                        + payload["values"].nbytes
+                        for payload
+                        in update_weights.values()
+                    )
+
+                else:
+
+                    raw_update_bytes = raw_tensor_bytes(
+                        update_weights
+                    )
+
+                upload_transfer_id = (
+                    uuid.uuid4().hex
+                )
+
+                upload_start = (
+                    time.perf_counter()
+                )
+
+                upload_chunks = iter_chunks(
+                    serialized_train_result,
+                    upload_transfer_id,
+                    client_id=str(client_id),
+                    executor_id=self.executor_id,
+                    event=commons.UPLOAD_MODEL,
+                )
+
+                future_call = (
+                    self.aggregator_communicator.stub
+                    .UPLOAD_DATA
+                    .future(
+                        upload_chunks
+                    )
+                )
+
+                def _upload_done_callback(
+                    completed_future,
+                    *,
+                    upload_start=upload_start,
+                    client_update_start=client_update_start,
+                    client_id=int(client_id),
+                    round_number=self.round,
+                    serialized_upload_bytes=len(serialized_train_result),
+                    raw_upload_bytes=raw_update_bytes,
+                    tensor_count=len(update_weights),
+                    download_duration_s=(self.last_model_download_duration_s),
+                    serialized_download_bytes=(self.last_model_download_bytes),
+                    training_duration_s=float(
+                        train_res.get("real_training_duration_s", 0.0)
+                    ),
+                ):
+                    upload_duration_s = (
+                        time.perf_counter() - upload_start
+                    )
+                    end_to_end_client_update_s = (
+                        time.perf_counter() - client_update_start
+                    )
+
+                    upload_throughput_mbps = (
+                        serialized_upload_bytes
+                        * 8
+                        / upload_duration_s
+                        / 1_000_000
+                        if upload_duration_s > 0
+                        else None
+                    )
+
+                    append_communication_record(
+                        self.communication_log_path,
+                        {
+                            "round": round_number,
+                            "executor_id": self.executor_id,
+                            "client_id": client_id,
+                            "direction": "upload",
+                            "payload_type": "client_training_result",
+                            "raw_update_bytes": raw_upload_bytes,
+                            "serialized_bytes": serialized_upload_bytes,
+                            "tensor_count": tensor_count,
+                            "method": getattr(
+                                self.args,
+                                "method",
+                                "full",
+                            ),
+                            "transfer_duration_s": upload_duration_s,
+                            "throughput_mbps": upload_throughput_mbps,
+                            "timing_scope": (
+                                "application_rpc_roundtrip_upload_completion"
+                            ),
+                        },
+                    )
+
+                    self._append_jsonl(
+                        self.client_update_log_path,
+                        {
+                            "timestamp": time.time(),
+                            "round": round_number,
+                            "executor_id": self.executor_id,
+                            "client_id": client_id,
+                            "model": getattr(self.args, "model", ""),
+                            "method": getattr(
+                                self.args,
+                                "method",
+                                "full",
+                            ),
+                            "download_duration_s": download_duration_s,
+                            "real_training_duration_s": training_duration_s,
+                            "upload_duration_s": upload_duration_s,
+                            "end_to_end_client_update_s": (
+                                end_to_end_client_update_s
+                            ),
+                            "serialized_download_bytes": (
+                                serialized_download_bytes
+                            ),
+                            "serialized_upload_bytes": (
+                                serialized_upload_bytes
+                            ),
+                        },
+                    )
+
+                    try:
+                        upload_reply = completed_future.result()
+                    except Exception as ex:
+                        logging.warning(
+                            "Streamed upload RPC failed for client %s: %s",
+                            client_id,
+                            ex,
+                        )
+                        return
+
+                    if not upload_reply.success:
+                        logging.warning(
+                            "Streamed upload rejected for client %s: %s",
+                            client_id,
+                            upload_reply.message,
+                        )
+                        return
+
+                    # UPLOAD_DATA wraps the normal FedScale ServerResponse
+                    # so the existing event-processing path is preserved.
+                    self.dispatch_worker_events(
+                        upload_reply.response,
+                        rpc_duration_s=upload_duration_s,
+                    )
+
+                future_call.add_done_callback(
+                    _upload_done_callback
+                )
+
+            elif current_event == commons.MODEL_TEST:
+
+                test_config = self.deserialize_response(
+                    request.meta
+                )
+
+                test_config["client_id"] = int(
+                    test_config["client_id"]
+                )
+
+                # UPDATE_MODEL has already installed the current
+                # global model on this executor.
+                test_config["model"] = (
+                    self.model_adapter.get_model()
+                )
+
+                self.Test(
+                    test_config
+                )
+
+            elif current_event == commons.UPDATE_MODEL:
+                (
+                    serialized_model_weights,
+                    update_download_duration_s,
+                    update_download_throughput_mbps,
+                ) = self.download_streamed_payload(
+                    request.data
+                )
+
+                method = getattr(
+                    self.args,
+                    "method",
+                    "full",
+                )
+
+                model_weights = self.deserialize_response(
+                    serialized_model_weights
+                )
+
+                # Cache these so the next CLIENT_TRAIN record can include
+                # the model download that preceded training.
+                self.last_model_download_duration_s = (
+                    update_download_duration_s
+                )
+                self.last_model_download_bytes = len(
+                    serialized_model_weights
+                )
+
+                if method == "topk":
+
+                    if model_weights.get("type") == "topk_full":
+
+                        raw_model_bytes = raw_tensor_bytes(
+                            model_weights["weights"]
+                        )
+
+                    else:
+
+                        raw_model_bytes = sum(
+                            payload["indices"].nbytes
+                            + payload["values"].nbytes
+                            for payload
+                            in model_weights["update"].values()
+                        )
+
+                else:
+
+                    raw_model_bytes = raw_tensor_bytes(
+                        model_weights
+                    )
+
+                append_communication_record(
+                    self.communication_log_path,
+                    {
+                        "round": self.round,
+                        "executor_id": self.executor_id,
+                        "client_id": None,
+                        "direction": "download",
+                        "payload_type": "training_model_update",
+                        "raw_model_bytes": raw_model_bytes,
+                        "serialized_bytes": len(
+                            serialized_model_weights
+                        ),
+                        "method": getattr(
+                            self.args,
+                            "method",
+                            "full",
+                        ),
+                        "transfer_duration_s":
+                            update_download_duration_s,
+                        "throughput_mbps":
+                            update_download_throughput_mbps,
+                        "timing_scope":
+                            "streamed_model_download",
+                    },
+                )
+
+                method = getattr(
+                    self.args,
+                    "method",
+                    "full",
+                )
+
+                if method == "topk":
+
+                    payload_type = model_weights.get(
+                        "type"
+                    )
+
+                    if payload_type == "topk_full":
+
+                        self.apply_topk_full_model(
+                            model_weights
+                        )
+
+                    elif payload_type == "topk_delta":
+
+                        self.apply_topk_model_delta(
+                            model_weights
+                        )
+
+                    else:
+
+                        raise RuntimeError(
+                            "Unknown Top-K model payload: "
+                            f"{payload_type}"
+                        )
+
+                else:
+
+                    self.UpdateModel(
+                        model_weights
+                    )
+
+            elif current_event == commons.SHUT_DOWN:
+                self.Stop()
+
+            elif current_event == commons.DUMMY_EVENT:
+                pass
 
     def log_test_result(self, test_res):
         """Log test results to wandb server if enabled"""

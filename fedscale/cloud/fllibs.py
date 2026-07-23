@@ -23,6 +23,8 @@ def import_libs():
     if parser.args.task == 'nlp' or parser.args.task == 'text_clf':
         global AdamW, AutoConfig, AutoTokenizer
         global AutoModelForMaskedLM, AutoModelForCausalLM
+        global AdamW, AutoConfig, AutoTokenizer
+        global AutoModelForMaskedLM, AutoModelForCausalLM
         global load_and_cache_examples, mask_tokens
 
         from transformers import (
@@ -30,6 +32,7 @@ def import_libs():
             AutoConfig,
             AutoTokenizer,
             AutoModelForMaskedLM,
+            AutoModelForCausalLM,
             AutoModelForCausalLM,
         )
 
@@ -129,6 +132,7 @@ def init_model():
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_name,
+            model_name,
             use_fast=False,
             token=hf_token,
         )
@@ -184,7 +188,52 @@ def init_model():
 
             if is_causal_lm:
                 peft_task_type = TaskType.CAUSAL_LM
+            from peft import (
+                LoraConfig,
+                get_peft_model,
+            )
+
+            if "distilbert" in model_name_lower:
+                target_modules = [
+                    "q_lin",
+                    "v_lin",
+                ]
+
+            elif is_causal_lm:
+                # Llama/Qwen-style attention projection names.
+                target_modules = [
+                    "q_proj",
+                    "v_proj",
+                ]
+
             else:
+                # BERT/ALBERT-style attention modules.
+                target_modules = [
+                    "query",
+                    "value",
+                ]
+
+            from peft import TaskType
+
+            if is_causal_lm:
+                peft_task_type = TaskType.CAUSAL_LM
+            else:
+                peft_task_type = TaskType.FEATURE_EXTRACTION
+
+            lora_kwargs = {
+                "r": 8,
+                "lora_alpha": 16,
+                "lora_dropout": 0.05,
+                "bias": "none",
+                "target_modules": target_modules,
+            }
+
+            if is_causal_lm:
+                from peft import TaskType
+
+                lora_kwargs["task_type"] = (
+                    TaskType.CAUSAL_LM
+                )
                 peft_task_type = TaskType.FEATURE_EXTRACTION
 
             lora_kwargs = {
@@ -204,6 +253,12 @@ def init_model():
 
             lora_config = LoraConfig(
                 **lora_kwargs
+                **lora_kwargs
+            )
+
+            model = get_peft_model(
+                model,
+                lora_config,
             )
 
             model = get_peft_model(
@@ -212,6 +267,7 @@ def init_model():
             )
 
             model.print_trainable_parameters()
+            
             
     elif parser.args.task == 'text_clf':
 
