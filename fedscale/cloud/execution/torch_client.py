@@ -181,6 +181,24 @@ class TorchClient(ClientBase):
         # Linux reports ru_maxrss in KiB. This is the process high-water mark.
         return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
 
+    @staticmethod
+    def _is_causal_lm(conf):
+        model_name = getattr(
+            conf,
+            "model",
+            "",
+        ).lower()
+
+        return any(
+            name in model_name
+            for name in (
+                "llama",
+                "qwen",
+                "mistral",
+                "gemma",
+            )
+        )
+
     def _get_memory_stats(self, model, optimizer):
         model_parameter_bytes = 0
         trainable_parameter_bytes = 0
@@ -312,10 +330,34 @@ class TorchClient(ClientBase):
     def train_step(self, client_data, conf, model, optimizer, criterion):
 
         for data_pair in client_data:
-            if conf.task == 'nlp':
+            if conf.task == "nlp":
                 (data, _) = data_pair
-                data, target = mask_tokens(
-                    data, conf.tokenizer, conf, device=self.device)
+
+                if self._is_causal_lm(conf):
+                    # Causal language modelling:
+                    # Hugging Face CausalLM models perform the label shift
+                    # internally when labels are supplied.
+                    data = data.to(
+                        device=self.device
+                    )
+
+                    target = data.clone()
+
+                    # Ignore padding tokens in the language-model loss.
+                    if conf.tokenizer.pad_token_id is not None:
+                        target[
+                            target == conf.tokenizer.pad_token_id
+                        ] = -100
+
+                else:
+                    # BERT / ALBERT / DistilBERT:
+                    # standard masked-language modelling.
+                    data, target = mask_tokens(
+                        data,
+                        conf.tokenizer,
+                        conf,
+                        device=self.device,
+                    )
             elif conf.task == 'voice':
                 (data, target, input_percentages,
                  target_sizes), _ = data_pair

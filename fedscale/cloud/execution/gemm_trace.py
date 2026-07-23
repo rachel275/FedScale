@@ -1,5 +1,5 @@
 """
-Lightweight GEMM tracer for PyTorch/FedScale experiments.
+Lightweight GEMM/GEMV tracer for PyTorch/FedScale experiments.
 
 The tracer instruments torch.nn.Linear modules and records the matrix
 multiplications performed during:
@@ -32,6 +32,7 @@ Each JSONL record contains fields such as:
         "executor_id": "1",
         "client_id": 42,
         "phase": "forward",
+        "operation_type": "gemm",
         "module": "...attention.query",
         "gemm_M": 128,
         "gemm_N": 768,
@@ -245,6 +246,27 @@ def _calculate_linear_shape(
     return int(m), int(n), int(k)
 
 
+def _classify_linear_operation(
+    m: int,
+) -> str:
+    """
+    Classify a Linear operation by its effective M dimension.
+
+    Returns:
+        "gemv" for M == 1
+        "small_m_gemm" for 2 <= M <= 8
+        "gemm" for M > 8
+    """
+
+    if m == 1:
+        return "gemv"
+
+    if m <= 8:
+        return "small_m_gemm"
+
+    return "gemm"
+
+
 def _write_record(
     *,
     phase: str,
@@ -267,11 +289,16 @@ def _write_record(
 
     flops = 2 * m * n * k
 
+    operation_type = _classify_linear_operation(
+        m
+    )
+
     record = {
         "method": _method,
         "executor_id": _executor_id,
         "client_id": _current_client_id,
         "phase": phase,
+        "operation_type": operation_type,
         "module": module_name,
         "gemm_M": m,
         "gemm_N": n,
