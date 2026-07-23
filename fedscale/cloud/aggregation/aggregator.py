@@ -36,6 +36,10 @@ from fedscale.cloud.execution.sparsification import (
     topk_compress,
     topk_decompress,
 )
+from fedscale.cloud.execution.sparsification import (
+    topk_compress,
+    topk_decompress,
+)
 
 MAX_MESSAGE_LENGTH = 1 * 1024 * 1024 * 1024  # 1GB
 
@@ -70,6 +74,13 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.update_lock = threading.Lock()
         # all weights including bias/#_batch_tracked (e.g., state_dict)
         self.model_weights = None
+        # Bidirectional Top-K state.
+        #
+        # Executors receive a full model once, then sparse global-model deltas
+        # on subsequent rounds.
+        self.topk_previous_global_state = None
+        self.topk_downlink_payload = None
+        self.topk_has_initial_sync = False
         # Bidirectional Top-K state.
         #
         # Executors receive a full model once, then sparse global-model deltas
@@ -229,6 +240,16 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             for name, tensor in model.state_dict().items()
         }
 
+    def get_named_global_state(self):
+        """Return the current global PyTorch state as named NumPy arrays."""
+
+        model = self.model_wrapper.get_model()
+
+        return {
+            name: tensor.detach().cpu().numpy().copy()
+            for name, tensor in model.state_dict().items()
+        }
+
     def get_model_weights_for_transfer(self):
         method = getattr(
             self.args,
@@ -237,7 +258,32 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         )
 
         if method == "lora":
+        method = getattr(
+            self.args,
+            "method",
+            "full",
+        )
+
+        if method == "lora":
             return self.model_wrapper.get_lora_weights()
+
+        if method == "topk":
+            # First transfer must be dense so the executor has a
+            # known base model for future sparse deltas.
+            if not self.topk_has_initial_sync:
+                return {
+                    "type": "topk_full",
+                    "round": self.round,
+                    "weights": self.get_named_global_state(),
+                }
+
+            # Subsequent transfers use the sparse global delta.
+            return {
+                "type": "topk_delta",
+                "base_round": self.round - 1,
+                "target_round": self.round,
+                "update": self.topk_downlink_payload,
+            }
 
         if method == "topk":
             # First transfer must be dense so the executor has a

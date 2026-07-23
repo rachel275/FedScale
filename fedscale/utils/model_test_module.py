@@ -168,23 +168,53 @@ def test_pytorch_model(rank, model, test_data, device='cpu', criterion=nn.NLLLos
             try:
                 if parser.args.task == 'nlp':
 
-                    data, target = mask_tokens(
-                        data,
-                        tokenizer,
-                        parser.args,
-                        device=device,
+                    model_name = parser.args.model.lower()
+
+                    is_causal_lm = any(
+                        name in model_name
+                        for name in (
+                            "llama",
+                            "qwen",
+                            "mistral",
+                            "gemma",
+                        )
                     )
 
-                    data = Variable(data).to(
-                        device=device
-                    )
+                    if is_causal_lm:
+                        # Causal language modelling:
+                        # predict each next token from preceding tokens.
+                        data = data.to(
+                            device=device
+                        )
 
-                    target = Variable(target).to(
-                        device=device
-                    )
+                        target = data.clone()
+
+                        # Ignore padding tokens when calculating loss.
+                        if tokenizer.pad_token_id is not None:
+                            target[
+                                target == tokenizer.pad_token_id
+                            ] = -100
+
+                    else:
+                        # Masked language modelling for
+                        # BERT / ALBERT / DistilBERT.
+                        data, target = mask_tokens(
+                            data,
+                            tokenizer,
+                            parser.args,
+                            device=device,
+                        )
+
+                        data = data.to(
+                            device=device
+                        )
+
+                        target = target.to(
+                            device=device
+                        )
 
                     outputs = model(
-                        data,
+                        input_ids=data,
                         labels=target,
                     )
 
@@ -194,17 +224,44 @@ def test_pytorch_model(rank, model, test_data, device='cpu', criterion=nn.NLLLos
                     test_loss += loss.item()
                     perplexity_loss += loss.item()
 
-                    # Only evaluate positions that actually have
-                    # MLM targets. Unmasked positions are -100.
-                    valid_mask = target.ne(-100)
+                    if is_causal_lm:
+                        # Hugging Face causal-LM models shift logits
+                        # and labels internally when computing loss.
+                        #
+                        # For evaluation metrics, explicitly perform
+                        # the same one-token shift:
+                        #
+                        # logits[:, t] predicts target[:, t + 1].
+                        shift_logits = logits[
+                            :, :-1, :
+                        ].contiguous()
 
-                    valid_logits = logits[
-                        valid_mask
-                    ]
+                        shift_targets = target[
+                            :, 1:
+                        ].contiguous()
 
-                    valid_targets = target[
-                        valid_mask
-                    ]
+                        valid_mask = shift_targets.ne(-100)
+
+                        valid_logits = shift_logits[
+                            valid_mask
+                        ]
+
+                        valid_targets = shift_targets[
+                            valid_mask
+                        ]
+
+                    else:
+                        # For MLM, only positions selected for
+                        # masking have a valid target.
+                        valid_mask = target.ne(-100)
+
+                        valid_logits = logits[
+                            valid_mask
+                        ]
+
+                        valid_targets = target[
+                            valid_mask
+                        ]
 
                     if valid_targets.numel() > 0:
 
@@ -217,9 +274,8 @@ def test_pytorch_model(rank, model, test_data, device='cpu', criterion=nn.NLLLos
                         correct += acc[0].item()
                         top_5 += acc[1].item()
 
-                        # Count actual evaluated MLM tokens.
+                        # Count the actual number of evaluated tokens.
                         test_len += valid_targets.numel()
-
                 elif parser.args.task == 'tag':
                     data, target = Variable(data).to(
                         device=device), Variable(target).to(device=device)
@@ -315,6 +371,8 @@ def test_pytorch_model(rank, model, test_data, device='cpu', criterion=nn.NLLLos
             except Exception as ex:
                 logging.info(f"Testing of failed as {ex}")
                 break
+            if parser.args.task != "nlp":
+                test_len += len(target)
             if parser.args.task != "nlp":
                 test_len += len(target)
 
