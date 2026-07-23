@@ -168,24 +168,57 @@ def test_pytorch_model(rank, model, test_data, device='cpu', criterion=nn.NLLLos
             try:
                 if parser.args.task == 'nlp':
 
-                    # if parser.args.mlm else (data, data)
                     data, target = mask_tokens(
-                        data, tokenizer, parser.args, device=device)
-                    data, target = Variable(data).to(
-                        device=device), Variable(target).to(device=device)
+                        data,
+                        tokenizer,
+                        parser.args,
+                        device=device,
+                    )
 
-                    # if parser.args.mlm else model(data, labels=target)
-                    outputs = model(data, labels=target)
+                    data = Variable(data).to(
+                        device=device
+                    )
 
-                    loss = outputs[0]
-                    test_loss += loss.data.item()
-                    perplexity_loss += loss.data.item()
+                    target = Variable(target).to(
+                        device=device
+                    )
 
-                    acc = accuracy(
-                        outputs[1].reshape(-1, outputs[1].shape[2]), target.reshape(-1), topk=(1, 5))
+                    outputs = model(
+                        data,
+                        labels=target,
+                    )
 
-                    correct += acc[0].item()
-                    top_5 += acc[1].item()
+                    loss = outputs.loss
+                    logits = outputs.logits
+
+                    test_loss += loss.item()
+                    perplexity_loss += loss.item()
+
+                    # Only evaluate positions that actually have
+                    # MLM targets. Unmasked positions are -100.
+                    valid_mask = target.ne(-100)
+
+                    valid_logits = logits[
+                        valid_mask
+                    ]
+
+                    valid_targets = target[
+                        valid_mask
+                    ]
+
+                    if valid_targets.numel() > 0:
+
+                        acc = accuracy(
+                            valid_logits,
+                            valid_targets,
+                            topk=(1, 5),
+                        )
+
+                        correct += acc[0].item()
+                        top_5 += acc[1].item()
+
+                        # Count actual evaluated MLM tokens.
+                        test_len += valid_targets.numel()
 
                 elif parser.args.task == 'tag':
                     data, target = Variable(data).to(
@@ -282,7 +315,8 @@ def test_pytorch_model(rank, model, test_data, device='cpu', criterion=nn.NLLLos
             except Exception as ex:
                 logging.info(f"Testing of failed as {ex}")
                 break
-            test_len += len(target)
+            if parser.args.task != "nlp":
+                test_len += len(target)
 
     if parser.args.task == 'voice':
         correct,  top_5, test_len = float(
