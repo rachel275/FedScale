@@ -258,11 +258,11 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         )
 
         if method == "lora":
-        method = getattr(
-            self.args,
-            "method",
-            "full",
-        )
+            method = getattr(
+                self.args,
+                "method",
+                "full",
+            )
 
         if method == "lora":
             return self.model_wrapper.get_lora_weights()
@@ -545,6 +545,14 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
                 sampledClientsReal[k]
                 for k in workers_sorted_by_completion_time[num_clients_to_collect:]
             ]
+            if not top_k_index:
+                logging.warning(
+                    "No available clients selected at virtual clock %.3f; "
+                    "skipping round scheduling until a client is online",
+                    self.global_virtual_clock,
+                )
+                return [], [], {}, 0.0, []
+
             round_duration = completionTimes[top_k_index[-1]]
             completionTimes.sort()
 

@@ -42,4 +42,4 @@ fedscale/cache
 fedscale/tmp*
 fedscale/*.tflite
 fedscale/*.ckpt
-fedscale/cloud/aggregation/cache
+fedscale/cloud/aggregation/cachebenchmark/dataset/blog.tar.gz

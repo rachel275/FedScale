@@ -253,12 +253,6 @@ def init_model():
 
             lora_config = LoraConfig(
                 **lora_kwargs
-                **lora_kwargs
-            )
-
-            model = get_peft_model(
-                model,
-                lora_config,
             )
 
             model = get_peft_model(
