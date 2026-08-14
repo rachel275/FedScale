@@ -257,14 +257,14 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             "full",
         )
 
-        if method == "lora":
+        if method in ("lora", "qlora"):
             method = getattr(
                 self.args,
                 "method",
                 "full",
             )
 
-        if method == "lora":
+        if method in ("lora", "qlora"):
             return self.model_wrapper.get_lora_weights()
 
         if method == "topk":
@@ -662,7 +662,7 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         update_weights = results["update_weight"]
 
         # LoRA: aggregate adapter weights by parameter name.
-        if getattr(self.args, "method", "full") == "lora":
+        if getattr(self.args, "method", "full",) in ("lora", "qlora"):
             if self._is_first_result_in_round():
                 self.model_weights = {
                     name: weight.copy()

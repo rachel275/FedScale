@@ -11,7 +11,8 @@ import torch
 from torch.autograd import Variable
 from overrides import overrides
 from torch.nn import CTCLoss
-
+from torch.profiler import profile, ProfilerActivity
+import os
 from fedscale.cloud.execution.client_base import ClientBase
 from fedscale.cloud.execution.optimizers import ClientOptimizer
 from fedscale.cloud.internal.torch_model_adapter import TorchModelAdapter
@@ -95,7 +96,7 @@ class TorchClient(ClientBase):
                 error_type = ex
                 break
 
-        if getattr(conf, "method", "full") == "lora":
+        if getattr(conf, "method", "full") in ("lora", "qlora"):
             from peft import get_peft_model_state_dict
 
             state_dicts = get_peft_model_state_dict(model)
@@ -330,6 +331,21 @@ class TorchClient(ClientBase):
     def train_step(self, client_data, conf, model, optimizer, criterion):
 
         for data_pair in client_data:
+            profile_this_step = (
+                conf.task == "nlp"
+                and self.completed_steps == 0
+            )
+
+            prof = None
+
+            if profile_this_step:
+                prof = profile(
+                    activities=[ProfilerActivity.CPU],
+                    record_shapes=True,
+                    with_stack=True,
+                    with_flops=True,
+                )
+              prof.__enter__()
             if conf.task == "nlp":
                 (data, _) = data_pair
 
@@ -447,6 +463,159 @@ class TorchClient(ClientBase):
             loss.backward()
             optimizer.step()
 
+            if profile_this_step:
+                prof.__exit__(None, None, None)
+
+                profile_dir = os.environ.get(
+                    "OPERATOR_PROFILE_DIR",
+                    "/workspace/results",
+                )
+
+                os.makedirs(
+                    profile_dir,
+                    exist_ok=True,
+                )
+
+                # --------------------------------------------------------
+                # 1. Full operator table
+                # --------------------------------------------------------
+
+                profile_path = os.path.join(
+                    profile_dir,
+                    "operator-profile.txt",
+                )
+
+                with open(profile_path, "w") as f:
+                    f.write(
+                        prof.key_averages(
+                            group_by_input_shape=True
+                        ).table(
+                            sort_by="self_cpu_time_total",
+                            row_limit=2000,
+                        )
+                    )
+
+                # --------------------------------------------------------
+                # 2. Every individual operator event
+                # --------------------------------------------------------
+
+                all_ops_path = os.path.join(
+                    profile_dir,
+                    "all-operators.txt",
+                )
+
+                with open(all_ops_path, "w") as f:
+
+                    for event in prof.events():
+
+                        f.write(
+                            f"name={event.name}\n"
+                        )
+
+                        f.write(
+                            f"shapes={event.input_shapes}\n"
+                        )
+
+                        f.write(
+                            f"self_cpu_us="
+                            f"{event.self_cpu_time_total}\n"
+                        )
+
+                        f.write(
+                            f"cpu_total_us="
+                            f"{event.cpu_time_total}\n"
+                        )
+
+                        f.write(
+                            f"flops={event.flops}\n"
+                        )
+
+                        f.write("\n")
+
+                # --------------------------------------------------------
+                # 3. Broad matrix-operation candidate list
+                # --------------------------------------------------------
+
+                matrix_keywords = (
+                    "mm",
+                    "matmul",
+                    "bmm",
+                    "addmm",
+                    "baddbmm",
+                    "linear",
+                    "einsum",
+                    "scaled_dot_product",
+                )
+
+                matrix_path = os.path.join(
+                    profile_dir,
+                    "matrix-operators.txt",
+                )
+
+                with open(matrix_path, "w") as f:
+
+                    for event in prof.events():
+
+                        name_lower = event.name.lower()
+
+                        if not any(
+                            keyword in name_lower
+                            for keyword in matrix_keywords
+                        ):
+                            continue
+
+                        f.write(
+                            f"name={event.name}\n"
+                        )
+
+                        f.write(
+                            f"shapes={event.input_shapes}\n"
+                        )
+
+                        f.write(
+                            f"self_cpu_us="
+                            f"{event.self_cpu_time_total}\n"
+                        )
+
+                        f.write(
+                            f"cpu_total_us="
+                            f"{event.cpu_time_total}\n"
+                        )
+
+                        f.write(
+                            f"flops={event.flops}\n"
+                        )
+
+                        f.write("\n")
+
+                # --------------------------------------------------------
+                # 4. Chrome trace: lets us inspect parent/child nesting
+                # --------------------------------------------------------
+
+                chrome_path = os.path.join(
+                    profile_dir,
+                    "operator-trace.json",
+                )
+
+                prof.export_chrome_trace(
+                    chrome_path
+                )
+
+                print(
+                    "[OPERATOR PROFILE] wrote:"
+                )
+                print(
+                    f"  {profile_path}"
+                )
+                print(
+                    f"  {all_ops_path}"
+                )
+                print(
+                    f"  {matrix_path}"
+                )
+                print(
+                    f"  {chrome_path}"
+                )
             # ========= Weight handler ========================
             self.optimizer.update_client_weight(
                 conf, model, self.global_model if self.global_model is not None else None)
@@ -487,3 +656,4 @@ class TorchClient(ClientBase):
         :return: a model adapter containing the model
         """
         return TorchModelAdapter(model)
+

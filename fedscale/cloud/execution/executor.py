@@ -281,7 +281,7 @@ class Executor(object):
 
     def set_received_weights(self, weights):
         """Apply full-model or LoRA adapter weights received from aggregator."""
-        if getattr(self.args, "method", "full") == "lora":
+        if getattr(self.args, "method", "full") in ("lora", "qlora"):
             self.model_adapter.set_lora_weights(weights)
         else:
             self.model_adapter.set_weights(
@@ -996,3 +996,4 @@ class Executor(object):
 if __name__ == "__main__":
     executor = Executor(parser.args)
     executor.run()
+
