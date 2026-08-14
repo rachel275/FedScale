@@ -137,132 +137,103 @@ def init_model():
             token=hf_token,
         )
 
-        if is_causal_lm:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                token=hf_token,
-            )
 
-            # Many decoder-only models, including Llama,
-            # do not define a padding token by default.
+
+        if is_causal_lm:
+
+            if parser.args.method == "qlora":
+                import torch
+                from transformers import BitsAndBytesConfig
+
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.float32,
+                )
+
+                logging.info(
+                    "Loading causal LM with QLoRA 4-bit NF4 quantization"
+                )
+
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    token=hf_token,
+                    quantization_config=quantization_config,
+                )
+
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    token=hf_token,
+                )
+
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
 
-            model.config.pad_token_id = (
-                tokenizer.pad_token_id
-            )
-
+            model.config.pad_token_id = tokenizer.pad_token_id
         else:
             model = AutoModelForMaskedLM.from_pretrained(
                 model_name,
                 token=hf_token,
             )
 
-        if parser.args.method == "lora":
-            from peft import (
-                LoraConfig,
-                get_peft_model,
-            )
+            
+            if parser.args.method in ("lora", "qlora"):
 
-            if "distilbert" in model_name_lower:
-                target_modules = [
-                    "q_lin",
-                    "v_lin",
-                ]
-
-            elif is_causal_lm:
-                # Llama/Qwen-style attention projection names.
-                target_modules = [
-                    "q_proj",
-                    "v_proj",
-                ]
-
-            else:
-                # BERT/ALBERT-style attention modules.
-                target_modules = [
-                    "query",
-                    "value",
-                ]
-
-            from peft import TaskType
-
-            if is_causal_lm:
-                peft_task_type = TaskType.CAUSAL_LM
-            from peft import (
-                LoraConfig,
-                get_peft_model,
-            )
-
-            if "distilbert" in model_name_lower:
-                target_modules = [
-                    "q_lin",
-                    "v_lin",
-                ]
-
-            elif is_causal_lm:
-                # Llama/Qwen-style attention projection names.
-                target_modules = [
-                    "q_proj",
-                    "v_proj",
-                ]
-
-            else:
-                # BERT/ALBERT-style attention modules.
-                target_modules = [
-                    "query",
-                    "value",
-                ]
-
-            from peft import TaskType
-
-            if is_causal_lm:
-                peft_task_type = TaskType.CAUSAL_LM
-            else:
-                peft_task_type = TaskType.FEATURE_EXTRACTION
-
-            lora_kwargs = {
-                "r": 8,
-                "lora_alpha": 16,
-                "lora_dropout": 0.05,
-                "bias": "none",
-                "target_modules": target_modules,
-            }
-
-            if is_causal_lm:
-                from peft import TaskType
-
-                lora_kwargs["task_type"] = (
-                    TaskType.CAUSAL_LM
-                )
-                peft_task_type = TaskType.FEATURE_EXTRACTION
-
-            lora_kwargs = {
-                "r": 8,
-                "lora_alpha": 16,
-                "lora_dropout": 0.05,
-                "bias": "none",
-                "target_modules": target_modules,
-            }
-
-            if is_causal_lm:
-                from peft import TaskType
-
-                lora_kwargs["task_type"] = (
-                    TaskType.CAUSAL_LM
+                from peft import (
+                    LoraConfig,
+                    TaskType,
+                    get_peft_model,
                 )
 
-            lora_config = LoraConfig(
-                **lora_kwargs
-            )
+                if parser.args.method == "qlora":
+                    from peft import prepare_model_for_kbit_training
 
-            model = get_peft_model(
-                model,
-                lora_config,
-            )
+                    logging.info(
+                        "Preparing quantized model for QLoRA training"
+                    )
 
-            model.print_trainable_parameters()
-            
-            
+                    model = prepare_model_for_kbit_training(model)
+
+                if "distilbert" in model_name_lower:
+                    target_modules = [
+                        "q_lin",
+                        "v_lin",
+                    ]
+
+                elif is_causal_lm:
+                    target_modules = [
+                        "q_proj",
+                        "v_proj",
+                    ]
+
+                else:
+                    target_modules = [
+                        "query",
+                        "value",
+                    ]
+
+                if is_causal_lm:
+                    peft_task_type = TaskType.CAUSAL_LM
+                else:
+                    peft_task_type = TaskType.FEATURE_EXTRACTION
+
+                lora_config = LoraConfig(
+                    r=8,
+                    lora_alpha=16,
+                    lora_dropout=0.05,
+                    bias="none",
+                    target_modules=target_modules,
+                    task_type=peft_task_type,
+                )
+
+                model = get_peft_model(
+                    model,
+                    lora_config,
+                )
+
+                model.print_trainable_parameters()
     elif parser.args.task == 'text_clf':
 
         if parser.args.model == 'albert':
