@@ -51,6 +51,7 @@ parser.add_argument(
 parser.add_argument("--data_map_file", type=str, default=None)
 parser.add_argument("--use_cuda", type=str, default="True")
 parser.add_argument("--cuda_device", type=str, default=None)
+parser.add_argument("--use_dcpu", type=str, default="False")
 parser.add_argument("--time_stamp", type=str, default="logs")
 parser.add_argument("--task", type=str, default="cv")
 parser.add_argument("--device_avail_file", type=str, default=None)
@@ -310,7 +311,7 @@ parser.add_argument(
 
 args, unknown = parser.parse_known_args()
 args.use_cuda = eval(args.use_cuda)
-
+args.use_dcpu = eval(args.use_dcpu)
 
 datasetCategories = {
     "Mnist": 10,

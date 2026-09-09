@@ -8,6 +8,10 @@ import time
 import psutil
 
 import torch
+try:
+    import torch_dcpu
+except ImportError:
+    torch_dcpu = None
 from torch.autograd import Variable
 from overrides import overrides
 from torch.nn import CTCLoss
@@ -30,8 +34,21 @@ class TorchClient(ClientBase):
         """
         self.args = args
         self.optimizer = ClientOptimizer()
-        self.device = args.cuda_device if args.use_cuda else torch.device(
-            'cpu')
+        
+        if getattr(args, "use_dcpu", False):
+            if torch_dcpu is None:
+                raise RuntimeError(
+                    "use_dcpu=True but torch_dcpu is not installed"
+                )
+
+            self.device = torch.device("dcpu")
+
+        elif args.use_cuda:
+            self.device = args.cuda_device
+
+        else:
+            self.device = torch.device("cpu")
+
         if args.task == "detection":
             self.im_data = Variable(torch.FloatTensor(1).cuda())
             self.im_info = Variable(torch.FloatTensor(1).cuda())
