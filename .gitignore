@@ -44,3 +44,8 @@ fedscale/*.tflite
 fedscale/*.ckpt
 fedscale/cloud/aggregation/cachebenchmark/dataset/blog.tar.gz
 .venv/
+
+.venv/
+venv/
+__pycache__/
+*.pyc
