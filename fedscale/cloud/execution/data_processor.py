@@ -11,7 +11,7 @@ def collate(examples):
             "NLP tokenizer has not been initialized before collate()"
         )
 
-    if tokenizer._pad_token is None:
+    if tokenizer.pad_token is None:
         return (
             pad_sequence(examples, batch_first=True),
             None,

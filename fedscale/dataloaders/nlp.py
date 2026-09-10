@@ -62,16 +62,20 @@ def feature_creation_worker(files, tokenizer, block_size, worker_idx):
             with open(file, encoding="utf-8", errors='ignore') as f:
                 text = f.read()
 
-            tokenized_text = tokenizer.convert_tokens_to_ids(
-                tokenizer.tokenize(text))
+            tokenized_text = tokenizer(
+                text,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )["input_ids"]
+
             if len(tokenized_text) > 0:
                 user_id += 1
 
-            # Truncate in block of block_size
+            # Truncate in blocks of block_size
             for i in range(0, len(tokenized_text) - block_size + 1, block_size):
-                examples.append(tokenizer.build_inputs_with_special_tokens(
-                    tokenized_text[i: i + block_size]))
-                client_mapping[user_id].append(len(examples)-1)
+                examples.append(tokenized_text[i:i + block_size])
+                client_mapping[user_id].append(len(examples) - 1)
                 sample_client.append(user_id)
         except Exception as e:
             logging.error(f"Worker {worker_idx}: fail due to {e}")

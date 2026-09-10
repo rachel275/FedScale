@@ -362,7 +362,7 @@ class TorchClient(ClientBase):
                     with_stack=True,
                     with_flops=True,
                 )
-              prof.__enter__()
+            prof.__enter__()
             if conf.task == "nlp":
                 (data, _) = data_pair
 

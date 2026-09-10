@@ -23,16 +23,14 @@ def import_libs():
     if parser.args.task == 'nlp' or parser.args.task == 'text_clf':
         global AdamW, AutoConfig, AutoTokenizer
         global AutoModelForMaskedLM, AutoModelForCausalLM
-        global AdamW, AutoConfig, AutoTokenizer
-        global AutoModelForMaskedLM, AutoModelForCausalLM
         global load_and_cache_examples, mask_tokens
 
+        from torch.optim import AdamW
+        
         from transformers import (
-            AdamW,
             AutoConfig,
             AutoTokenizer,
             AutoModelForMaskedLM,
-            AutoModelForCausalLM,
             AutoModelForCausalLM,
         )
 
@@ -132,108 +130,89 @@ def init_model():
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_name,
-            model_name,
             use_fast=False,
             token=hf_token,
         )
 
-
-
         if is_causal_lm:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                token=hf_token,
+            )
 
-            if parser.args.method == "qlora":
-                import torch
-                from transformers import BitsAndBytesConfig
-
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=torch.float32,
-                )
-
-                logging.info(
-                    "Loading causal LM with QLoRA 4-bit NF4 quantization"
-                )
-
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    token=hf_token,
-                    quantization_config=quantization_config,
-                )
-
-            else:
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    token=hf_token,
-                )
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                token=hf_token,
+            )
 
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
 
             model.config.pad_token_id = tokenizer.pad_token_id
+
         else:
             model = AutoModelForMaskedLM.from_pretrained(
                 model_name,
                 token=hf_token,
             )
 
-            
-            if parser.args.method in ("lora", "qlora"):
 
-                from peft import (
-                    LoraConfig,
-                    TaskType,
-                    get_peft_model,
+        if parser.args.method in ("lora", "qlora"):
+
+            from peft import (
+                LoraConfig,
+                TaskType,
+                get_peft_model,
+            )
+
+            if parser.args.method == "qlora":
+                from peft import prepare_model_for_kbit_training
+
+                logging.info(
+                    "Preparing quantized model for QLoRA training"
                 )
 
-                if parser.args.method == "qlora":
-                    from peft import prepare_model_for_kbit_training
+                model = prepare_model_for_kbit_training(model)
 
-                    logging.info(
-                        "Preparing quantized model for QLoRA training"
-                    )
+            if "distilbert" in model_name_lower:
+                target_modules = [
+                    "q_lin",
+                    "v_lin",
+                ]
 
-                    model = prepare_model_for_kbit_training(model)
+            elif is_causal_lm:
+                target_modules = [
+                    "q_proj",
+                    "v_proj",
+                ]
 
-                if "distilbert" in model_name_lower:
-                    target_modules = [
-                        "q_lin",
-                        "v_lin",
-                    ]
+            else:
+                target_modules = [
+                    "query",
+                    "value",
+                ]
 
-                elif is_causal_lm:
-                    target_modules = [
-                        "q_proj",
-                        "v_proj",
-                    ]
+            if is_causal_lm:
+                peft_task_type = TaskType.CAUSAL_LM
+            else:
+                peft_task_type = TaskType.FEATURE_EXTRACTION
 
-                else:
-                    target_modules = [
-                        "query",
-                        "value",
-                    ]
+            lora_config = LoraConfig(
+                r=8,
+                lora_alpha=16,
+                lora_dropout=0.05,
+                bias="none",
+                target_modules=target_modules,
+                task_type=peft_task_type,
+            )
 
-                if is_causal_lm:
-                    peft_task_type = TaskType.CAUSAL_LM
-                else:
-                    peft_task_type = TaskType.FEATURE_EXTRACTION
+            model = get_peft_model(
+                model,
+                lora_config,
+            )
 
-                lora_config = LoraConfig(
-                    r=8,
-                    lora_alpha=16,
-                    lora_dropout=0.05,
-                    bias="none",
-                    target_modules=target_modules,
-                    task_type=peft_task_type,
-                )
+            model.print_trainable_parameters()
 
-                model = get_peft_model(
-                    model,
-                    lora_config,
-                )
-
-                model.print_trainable_parameters()
     elif parser.args.task == 'text_clf':
 
         if parser.args.model == 'albert':
