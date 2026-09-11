@@ -384,6 +384,15 @@ class Executor(object):
 
         """
         self.round += 1
+        
+        if getattr(self.args, "simulate_aggregation", False):
+            logging.info(
+                "Simulated aggregation: retaining locally resident "
+                "model for round %d",
+                self.round,
+            )
+            return
+
         self.set_received_weights(model_weights) #, is_aggregator=False)
 
     def Train(self, config):
@@ -884,6 +893,25 @@ class Executor(object):
                 self.last_model_download_bytes = len(
                     serialized_model_weights
                 )
+
+                if (
+                    isinstance(model_weights, dict)
+                    and model_weights.get("type") == "simulated"
+                ):
+                    self.round = int(
+                        model_weights.get(
+                            "round",
+                            self.round + 1,
+                        )
+                    )
+
+                    logging.info(
+                        "Simulated aggregation: retaining locally resident "
+                        "model for round %d",
+                        self.round,
+                    )
+
+                    continue
 
                 if method == "topk":
 

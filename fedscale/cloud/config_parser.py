@@ -14,6 +14,12 @@ parser.add_argument("--ps_ip", type=str, default="127.0.0.1")
 parser.add_argument("--ps_port", type=str, default="29500")
 parser.add_argument("--this_rank", type=int, default=1)
 parser.add_argument("--connection_timeout", type=int, default=60)
+parser.add_argument(
+    "--simulate_aggregation",
+    type=str,
+    default="False",
+    help="Run real client training but do not materialize or aggregate model weights",
+)
 parser.add_argument("--experiment_mode", type=str, default=commons.SIMULATION_MODE)
 parser.add_argument(
     "--engine",
@@ -310,7 +316,7 @@ parser.add_argument(
 
 args, unknown = parser.parse_known_args()
 args.use_cuda = eval(args.use_cuda)
-
+args.simulate_aggregation = eval(args.simulate_aggregation)
 
 datasetCategories = {
     "Mnist": 10,
