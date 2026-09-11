@@ -34,7 +34,8 @@ class TorchClient(ClientBase):
         """
         self.args = args
         self.optimizer = ClientOptimizer()
-        
+       
+        args.use_dcpu = False
         if getattr(args, "use_dcpu", False):
             if torch_dcpu is None:
                 raise RuntimeError(
@@ -362,7 +363,7 @@ class TorchClient(ClientBase):
                     with_stack=True,
                     with_flops=True,
                 )
-            prof.__enter__()
+                prof.__enter__()
             if conf.task == "nlp":
                 (data, _) = data_pair
 
