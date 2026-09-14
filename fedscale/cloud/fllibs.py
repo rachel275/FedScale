@@ -27,10 +27,10 @@ def import_libs():
 
         from torch.optim import AdamW
         
+
         from transformers import (
+            AdamW,
             AutoConfig,
-            AutoTokenizer,
-            AutoModelForMaskedLM,
             AutoModelForCausalLM,
         )
 
@@ -135,15 +135,31 @@ def init_model():
         )
 
         if is_causal_lm:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                token=hf_token,
-            )
+            if parser.args.method == "qlora":
+                import torch
+                from transformers import BitsAndBytesConfig
 
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                token=hf_token,
-            )
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.float32,
+                )
+
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    token=hf_token,
+                    quantization_config=quantization_config,
+                )
+            else:
+                import torch
+
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    token=hf_token,
+                    torch_dtype=torch.bfloat16,
+                    low_cpu_mem_usage=True,
+                )
 
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
@@ -157,8 +173,8 @@ def init_model():
             )
 
 
+        # Apply LoRA / QLoRA AFTER loading either model type
         if parser.args.method in ("lora", "qlora"):
-
             from peft import (
                 LoraConfig,
                 TaskType,

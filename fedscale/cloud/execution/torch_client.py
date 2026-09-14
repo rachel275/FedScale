@@ -120,44 +120,53 @@ class TorchClient(ClientBase):
                 error_type = ex
                 break
 
-        if getattr(conf, "method", "full") in ("lora", "qlora"):
-            from peft import get_peft_model_state_dict
+        simulate_aggregation = getattr(
+            conf,
+            "simulate_aggregation",
+            False,
+        )
 
-            state_dicts = get_peft_model_state_dict(model)
+        model_param = None
 
-            model_param = {
-                name: tensor.detach().cpu().numpy()
-                for name, tensor in state_dicts.items()
-            }
+        if not simulate_aggregation:
+            if getattr(conf, "method", "full") in ("lora", "qlora"):
+                from peft import get_peft_model_state_dict
 
-        elif method == "topk":
+                state_dicts = get_peft_model_state_dict(model)
 
-            from fedscale.cloud.execution.sparsification import (
-                topk_compress,
-            )
+                model_param = {
+                    name: tensor.detach().cpu().numpy()
+                    for name, tensor in state_dicts.items()
+                }
 
-            final_state = {
-                name: tensor.detach().cpu().numpy()
-                for name, tensor in model.state_dict().items()
-            }
+            elif method == "topk":
 
-            delta_state = {
-                name: final_state[name]
-                - initial_state[name]
-                for name in final_state
-            }
+                from fedscale.cloud.execution.sparsification import (
+                    topk_compress,
+                )
 
-            model_param = topk_compress(
-                delta_state,
-               conf.topk_ratio,
-            )
-        else:
-            state_dicts = model.state_dict()
+                final_state = {
+                    name: tensor.detach().cpu().numpy()
+                    for name, tensor in model.state_dict().items()
+                }
 
-            model_param = {
-                name: tensor.detach().cpu().numpy()
-                for name, tensor in state_dicts.items()
-            }
+                delta_state = {
+                    name: final_state[name]
+                    - initial_state[name]
+                    for name in final_state
+                }
+
+                model_param = topk_compress(
+                    delta_state,
+                   conf.topk_ratio,
+                )
+            else:
+                state_dicts = model.state_dict()
+
+                model_param = {
+                    name: tensor.detach().cpu().numpy()
+                    for name, tensor in state_dicts.items()
+                }
 
         real_training_duration_s = time.perf_counter() - train_start
         memory_stats = self._get_memory_stats(model, optimizer)
@@ -179,7 +188,11 @@ class TorchClient(ClientBase):
 
         results['utility'] = math.sqrt(
             self.loss_squared) * float(trained_unique_samples)
-        results['update_weight'] = model_param
+        
+        if simulate_aggregation:
+            results["simulated_update"] = True
+        else:
+            results["update_weight"] = model_param
         results['wall_duration'] = real_training_duration_s
 
         # Keep scalar metrics in the result for easy downstream summaries.
@@ -663,8 +676,6 @@ class TorchClient(ClientBase):
             criterion = CTCLoss(reduction='mean').to(device=self.device)
         else:
             criterion = torch.nn.CrossEntropyLoss().to(device=self.device)
-
-        logging.info("TorchClient.test: before test_pytorch_model")
 
         test_loss, acc, acc_5, test_results = test_pytorch_model(conf.rank, model, client_data,
                                                                  device=self.device, criterion=criterion,

@@ -322,7 +322,11 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
             )
         else:
             raise ValueError(f"{self.args.engine} is not a supported engine.")
-        self.model_weights = self.model_wrapper.get_weights()
+
+        if getattr(self.args, "method", "full") in ("lora", "qlora"):
+            self.model_weights = self.model_wrapper.get_lora_weights()
+        else:
+            self.model_weights = self.model_wrapper.get_weights()
 
     def init_task_context(self):
         """Initiate execution context for specific tasks"""
@@ -588,12 +592,26 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
         self.init_control_communication()
         self.init_data_communication()
+        
+        if getattr(self.args, "simulate_aggregation", False):
+            logging.info(
+                "Simulated aggregation enabled: "
+                "aggregator will not instantiate the global model"
+            )
 
-        self.init_model()
-        self.model_update_size = (
-            sys.getsizeof(pickle.dumps(self.model_wrapper)) / 1024.0 * 8.0
-        )  # kbits
-
+            # The executor owns the training model.  The aggregator only
+            # maintains FL control-plane state in this mode.
+            self.model_wrapper = None
+            self.model_weights = None
+            self.model_update_size = 0.0
+        else:
+            self.init_model()
+            self.model_update_size = (
+                sys.getsizeof(pickle.dumps(self.model_wrapper))
+                / 1024.0
+                * 8.0
+            )  # kbits
+        
         self.event_monitor()
         self.stop()
 
@@ -652,8 +670,19 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
         self.update_lock.acquire()
 
         self.model_in_update += 1
-        self.update_weight_aggregation(results)
 
+        if getattr(self.args, "simulate_aggregation", False):
+            logging.info(
+                "Simulated aggregation: accepted client=%s "
+                "for round=%s (%d/%d)",
+                results.get("client_id"),
+                self.round,
+                self.model_in_update,
+                self.tasks_round,
+            )
+        else:
+            self.update_weight_aggregation(results)
+    
         self.update_lock.release()
 
     def update_weight_aggregation(self, results):
@@ -1204,9 +1233,15 @@ class Aggregator(job_api_pb2_grpc.JobServiceServicer):
 
             elif current_event == commons.UPDATE_MODEL:
 
-                response_data = (
-                    self.get_model_weights_for_transfer()
-                )
+                if getattr(self.args, "simulate_aggregation", False):
+                    response_data = {
+                        "type": "simulated",
+                        "round": self.round,
+                    }
+                else:
+                    response_data = (
+                        self.get_model_weights_for_transfer()
+                    )
 
             elif current_event == commons.SHUT_DOWN:
 
