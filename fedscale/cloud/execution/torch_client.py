@@ -35,7 +35,6 @@ class TorchClient(ClientBase):
         self.args = args
         self.optimizer = ClientOptimizer()
        
-        args.use_dcpu = False
         if getattr(args, "use_dcpu", False):
             if torch_dcpu is None:
                 raise RuntimeError(
@@ -49,6 +48,13 @@ class TorchClient(ClientBase):
 
         else:
             self.device = torch.device("cpu")
+
+        logging.info(
+            "TorchClient device selection: use_dcpu=%s use_cuda=%s device=%s",
+            getattr(args, "use_dcpu", None),
+            getattr(args, "use_cuda", None),
+            self.device,
+        )
 
         if args.task == "detection":
             self.im_data = Variable(torch.FloatTensor(1).cuda())
@@ -657,6 +663,9 @@ class TorchClient(ClientBase):
             criterion = CTCLoss(reduction='mean').to(device=self.device)
         else:
             criterion = torch.nn.CrossEntropyLoss().to(device=self.device)
+
+        logging.info("TorchClient.test: before test_pytorch_model")
+
         test_loss, acc, acc_5, test_results = test_pytorch_model(conf.rank, model, client_data,
                                                                  device=self.device, criterion=criterion,
                                                                  tokenizer=conf.tokenizer)

@@ -63,8 +63,17 @@ def test_pytorch_model(rank, model, test_data, device='cpu', criterion=nn.NLLLos
     perplexity_loss = 0.
 
     total_cer, total_wer, num_tokens, num_chars = 0, 0, 0, 0
-
+    logging.info(
+        "test_pytorch_model: before model.to(device=%s)",
+         device,
+    )
     model = model.to(device=device)  # load by pickle
+    
+    logging.info(
+      "test_pytorch_model: after model.to(device=%s)",
+        device,
+    )
+
     model.eval()
     targets_list = []
     preds = []
@@ -181,14 +190,24 @@ def test_pytorch_model(rank, model, test_data, device='cpu', criterion=nn.NLLLos
                     )
 
                     if is_causal_lm:
-                        # Causal language modelling:
-                        # predict each next token from preceding tokens.
+                        logging.info(
+                            "test_pytorch_model: before data.to(device=%s), shape=%s dtype=%s",
+                            device,
+                            tuple(data.shape),
+                            data.dtype,
+                        )
+
                         data = data.to(
                             device=device
                         )
 
-                        target = data.clone()
+                        logging.info(
+                            "test_pytorch_model: after data.to(device=%s)",
+                            device,
+                        )
 
+                        target = data.clone()
+                    
                         # Ignore padding tokens when calculating loss.
                         if tokenizer.pad_token_id is not None:
                             target[

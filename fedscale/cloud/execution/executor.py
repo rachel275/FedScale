@@ -563,6 +563,10 @@ class Executor(object):
             test_config
         )
 
+        logging.info(
+           "testing_handler: before select_dataset"
+        )
+
         data_loader = select_dataset(
             self.this_rank,
             self.testing_sets,
@@ -572,11 +576,17 @@ class Executor(object):
             collate_fn=self.collate_fn,
         )
 
+        logging.info(
+            "testing_handler: after select_dataset"
+        )
+
         test_results = client.test(
             data_loader,
             model=self.model_adapter.get_model(),
             conf=test_config,
         )
+
+        logging.info("testing_handler: after client.test")
 
         self.log_test_result(
             test_results
