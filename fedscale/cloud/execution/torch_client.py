@@ -35,13 +35,17 @@ class TorchClient(ClientBase):
         self.args = args
         self.optimizer = ClientOptimizer()
        
-        if getattr(args, "use_dcpu", False):
+        self.use_dcpu = getattr(args, "use_dcpu", False)
+
+        if self.use_dcpu:
             if torch_dcpu is None:
                 raise RuntimeError(
                     "use_dcpu=True but torch_dcpu is not installed"
                 )
 
-            self.device = torch.device("dcpu")
+            # Keep the model and ordinary PyTorch tensors in host memory.
+            # torch_dcpu is used only as the distributed GEMM runtime.
+            self.device = torch.device("cpu")
 
         elif args.use_cuda:
             self.device = args.cuda_device
@@ -96,7 +100,9 @@ class TorchClient(ClientBase):
                 name: tensor.detach().cpu().numpy().copy()
                 for name, tensor in model.state_dict().items()
             }
-        model = model.to(device=self.device)
+        
+        if self.device.type != "dcpu":
+            model = model.to(device=self.device)
         model.train()
 
         trained_unique_samples = min(

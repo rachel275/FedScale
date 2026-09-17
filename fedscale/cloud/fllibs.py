@@ -29,7 +29,6 @@ def import_libs():
         
 
         from transformers import (
-            AdamW,
             AutoConfig,
             AutoModelForCausalLM,
         )
@@ -98,6 +97,92 @@ outputClass = {'Mnist': 10, 'cifar10': 10, "imagenet": 1000, 'emnist': 47, 'amaz
                'openImg': 596, 'google_speech': 35, 'femnist': 62, 'yelp': 5, 'inaturalist': 1010
                }
 
+def migrate_model_to_dgemm_arena(model):
+    """
+    Move all CPU parameter and buffer storage into the DGEMM shared arena.
+
+    PyTorch tensors remain ordinary device='cpu' tensors. Parameters are
+    migrated one at a time so that old checkpoint-backed storage can be
+    released progressively rather than duplicating the entire model at once.
+    """
+    import gc
+    import torch
+    import torch_dcpu
+
+    total_bytes = 0
+    migrated_bytes = 0
+    already_arena_bytes = 0
+    migrated_params = 0
+    migrated_buffers = 0
+
+    # Parameters. recurse=False is important because we walk every module
+    # ourselves and must not process a parameter multiple times.
+    for module in model.modules():
+        for name, param in list(module.named_parameters(recurse=False)):
+            if param is None:
+                continue
+
+            nbytes = param.numel() * param.element_size()
+            total_bytes += nbytes
+
+            if torch.ops.torch_dcpu.ptr_in_arena(param):
+                already_arena_bytes += nbytes
+                continue
+
+            old_data = param.data
+
+            new_data = torch.ops.torch_dcpu.arena_clone_cpu(
+                old_data.detach().contiguous()
+            )
+
+            # Preserve the Parameter object itself. This is preferable to
+            # replacing it because other model structures may hold references
+            # to the Parameter.
+            param.data = new_data
+
+            migrated_bytes += nbytes
+            migrated_params += 1
+
+            del old_data
+            del new_data
+
+        # Buffers are not Parameters, so replace the module's registered
+        # buffer tensor directly.
+        for name, buf in list(module.named_buffers(recurse=False)):
+            if buf is None:
+                continue
+
+            nbytes = buf.numel() * buf.element_size()
+            total_bytes += nbytes
+
+            if torch.ops.torch_dcpu.ptr_in_arena(buf):
+                already_arena_bytes += nbytes
+                continue
+
+            new_buf = torch.ops.torch_dcpu.arena_clone_cpu(
+                buf.detach().contiguous()
+            )
+
+            module._buffers[name] = new_buf
+
+            migrated_bytes += nbytes
+            migrated_buffers += 1
+
+    gc.collect()
+
+    logging.info(
+        "DGEMM arena migration complete: "
+        "%d parameters, %d buffers migrated; "
+        "%.3f GiB migrated, %.3f GiB already arena-backed, "
+        "%.3f GiB total tensor storage",
+        migrated_params,
+        migrated_buffers,
+        migrated_bytes / (1024 ** 3),
+        already_arena_bytes / (1024 ** 3),
+        total_bytes / (1024 ** 3),
+    )
+
+    return model
 
 def init_model():
     global tokenizer
@@ -134,6 +219,19 @@ def init_model():
             token=hf_token,
         )
 
+        # Install the shared-arena allocator only after tokenizer construction,
+        # but before model construction. From this point onward ordinary PyTorch
+        # CPU tensor storage is allocated directly from the DGEMM arena.
+        if getattr(parser.args, "use_dcpu", False):
+            import torch
+            import torch_dcpu
+
+            torch.ops.torch_dcpu.install_arena_cpu_allocator()
+
+            logging.info(
+                "Installed DGEMM shared arena as PyTorch CPU tensor allocator"
+            )
+
         if is_causal_lm:
             if parser.args.method == "qlora":
                 import torch
@@ -160,6 +258,17 @@ def init_model():
                     torch_dtype=torch.bfloat16,
                     low_cpu_mem_usage=True,
                 )
+            
+            # Hugging Face's low-memory checkpoint loader can construct parameter
+            # storage without going through PyTorch's normal CPU allocator. Migrate
+            # that pretrained storage into the shared DGEMM arena once loading has
+            # completed.
+            if getattr(parser.args, "use_dcpu", False):
+                logging.info(
+                    "Migrating pretrained model storage into DGEMM shared arena"
+                )
+
+                model = migrate_model_to_dgemm_arena(model)
 
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
@@ -226,6 +335,47 @@ def init_model():
                 model,
                 lora_config,
             )
+
+            # Verify that model parameters are backed by the DGEMM arena.
+            if getattr(parser.args, "use_dcpu", False):
+                total_params = 0
+                total_bytes = 0
+                arena_params = 0
+                arena_bytes = 0
+
+                for p in model.parameters():
+                    nbytes = p.numel() * p.element_size()
+
+                    total_params += p.numel()
+                    total_bytes += nbytes
+
+                    if torch.ops.torch_dcpu.ptr_in_arena(p):
+                        arena_params += p.numel()
+                        arena_bytes += nbytes
+
+                logging.info(
+                    "DGEMM arena parameter coverage: "
+                    "%d/%d params (%.2f%%), "
+                    "%.3f/%.3f GiB (%.2f%% bytes)",
+                    arena_params,
+                    total_params,
+                    100.0 * arena_params / max(total_params, 1),
+                    arena_bytes / (1024 ** 3),
+                    total_bytes / (1024 ** 3),
+                    100.0 * arena_bytes / max(total_bytes, 1),
+                )
+
+            if getattr(parser.args, "use_dcpu", False):
+                from fedscale.cloud.execution.dcpu_linear import (
+                    route_peft_base_linears,
+                )
+
+                routed = route_peft_base_linears(model)
+
+                logging.info(
+                    "DCPU CPU-resident routing installed for %d PEFT base Linear layers",
+                    routed,
+                )
 
             model.print_trainable_parameters()
 

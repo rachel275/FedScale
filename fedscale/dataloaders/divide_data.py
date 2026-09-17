@@ -141,5 +141,5 @@ def select_dataset(rank, partition, batch_size, args, isTest=False, collate_fn=N
         time_out = 60
 
     if collate_fn is not None:
-        return DataLoader(partition, batch_size=batch_size, shuffle=True, pin_memory=True, timeout=time_out, num_workers=num_loaders, drop_last=dropLast, collate_fn=collate_fn)
-    return DataLoader(partition, batch_size=batch_size, shuffle=True, pin_memory=True, timeout=time_out, num_workers=num_loaders, drop_last=dropLast)
+        return DataLoader(partition, batch_size=batch_size, shuffle=True, pin_memory=False, timeout=time_out, num_workers=num_loaders, drop_last=dropLast, collate_fn=collate_fn)
+    return DataLoader(partition, batch_size=batch_size, shuffle=True, pin_memory=False, timeout=time_out, num_workers=num_loaders, drop_last=dropLast)

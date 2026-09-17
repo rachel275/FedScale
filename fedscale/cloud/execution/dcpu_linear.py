@@ -1,0 +1,102 @@
+import torch
+import torch.nn as nn
+
+
+class DcpuRoutedLinear(nn.Module):
+    """
+    CPU Linear whose frozen base weight is stored directly in the
+    shared DGEMM frontend arena.
+
+    The weight remains an ordinary CPU PyTorch Parameter, so normal
+    CPU operations and local fallback continue to work.
+    """
+
+    def __init__(self, linear: nn.Linear):
+        super().__init__()
+
+        if not isinstance(linear, nn.Linear):
+            raise TypeError(
+                f"DcpuRoutedLinear expects nn.Linear, got {type(linear)}"
+            )
+
+        if linear.weight.requires_grad:
+            raise RuntimeError(
+                "DcpuRoutedLinear expected frozen PEFT base weight, "
+                "but weight.requires_grad=True"
+            )
+
+        weight = linear.weight.detach()
+
+        if torch.ops.torch_dcpu.ptr_in_arena(weight):
+            arena_weight = weight
+        else:
+            arena_weight = torch.ops.torch_dcpu.arena_clone_cpu(weight)
+
+        self.weight = nn.Parameter(
+            arena_weight,
+            requires_grad=False,
+        )
+
+        # Bias is small and is not a distributed GEMM operand.
+        self.bias = linear.bias
+
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original_shape = x.shape
+
+        if x.dim() < 2:
+            raise RuntimeError(
+                f"DcpuRoutedLinear expected >=2D input, got {tuple(x.shape)}"
+            )
+
+        x2 = x.reshape(-1, original_shape[-1])
+
+        y2 = torch.ops.torch_dcpu.linear_cpu(
+            x2,
+            self.weight,
+            self.bias,
+        )
+
+        return y2.reshape(
+            *original_shape[:-1],
+            self.out_features,
+        )
+
+
+def route_peft_base_linears(model):
+    """
+    Replace PEFT LoRA base_layer nn.Linear modules with DcpuRoutedLinear.
+
+    Frozen base weights are migrated into the shared DGEMM arena.
+    LoRA A/B modules remain ordinary CPU PyTorch operations.
+    """
+    routed = 0
+    arena_bytes = 0
+    for module in model.modules():
+        if not hasattr(module, "base_layer"):
+            continue
+
+        base = module.base_layer
+
+        if not isinstance(base, nn.Linear):
+            continue
+
+        module.base_layer = DcpuRoutedLinear(base)
+        routed += 1
+        arena_bytes += (
+            base.weight.numel() * base.weight.element_size()
+        )
+
+        print(
+            f"[dcpu] routed base linear {routed}: "
+            f"{base.in_features} -> {base.out_features}, "
+            f"arena total={arena_bytes / (1024**3):.3f} GiB"
+        )
+
+    print(
+        f"[dcpu] routed {routed} PEFT base linears; "
+        f"arena-backed weights={arena_bytes / (1024**3):.3f} GiB"
+    )
+    return routed

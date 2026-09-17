@@ -63,8 +63,14 @@ def test_pytorch_model(rank, model, test_data, device='cpu', criterion=nn.NLLLos
     perplexity_loss = 0.
 
     total_cer, total_wer, num_tokens, num_chars = 0, 0, 0, 0
-    model = model.to(device=device)  # load by pickle
+    logging.info("TEST DEBUG: before model.to device=%s", device)   
+    
+    if torch.device(device).type != "dcpu":
+        model = model.to(device=device)
+
+    logging.info("TEST DEBUG: after model.to")
     model.eval()
+    logging.info("TEST DEBUG: after model.eval")
     targets_list = []
     preds = []
 
@@ -210,10 +216,19 @@ def test_pytorch_model(rank, model, test_data, device='cpu', criterion=nn.NLLLos
                             device=device
                         )
 
+                    logging.info(
+                        "TEST DEBUG: before model forward model=%s device=%s data_shape=%s",
+                        parser.args.model,
+                        device,
+                        tuple(data.shape),
+                    )
+
                     outputs = model(
                         input_ids=data,
                         labels=target,
                     )
+
+                    logging.info("TEST DEBUG: after model forward")
 
                     loss = outputs.loss
                     logits = outputs.logits

@@ -39,7 +39,7 @@ parser.add_argument(
     "--method",
     type=str,
     default="full",
-    choices=["full", "lora", "topk"],
+    choices=["full", "qlora", "lora", "topk"],
 )
 
 parser.add_argument(

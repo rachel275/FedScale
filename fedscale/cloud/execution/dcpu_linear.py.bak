@@ -1,0 +1,71 @@
+import torch
+import torch.nn as nn
+
+
+class DcpuRoutedLinear(nn.Module):
+    """
+    CPU-resident Linear whose expensive GEMM may be routed through
+    torch_dcpu.
+
+    Parameters remain ordinary CPU tensors.  linear_cpu decides whether
+    to execute locally or stage this individual GEMM into the distributed
+    DGEMM arena.
+    """
+
+    def __init__(self, linear: nn.Linear):
+        super().__init__()
+
+        if not isinstance(linear, nn.Linear):
+            raise TypeError(
+                f"DcpuRoutedLinear expects nn.Linear, got {type(linear)}"
+            )
+
+        # Reuse the original Parameters. Do NOT copy them to DCPU.
+        self.weight = linear.weight
+        self.bias = linear.bias
+
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original_shape = x.shape
+
+        if x.dim() < 2:
+            raise RuntimeError(
+                f"DcpuRoutedLinear expected >=2D input, got {tuple(x.shape)}"
+            )
+
+        x2 = x.reshape(-1, original_shape[-1])
+
+        y2 = torch.ops.torch_dcpu.linear_cpu(
+            x2,
+            self.weight,
+            self.bias,
+        )
+
+        return y2.reshape(
+            *original_shape[:-1],
+            self.out_features,
+        
+        )
+def route_peft_base_linears(model):
+    """
+    Replace PEFT LoRA base_layer nn.Linear modules with DcpuRoutedLinear.
+
+    LoRA A/B modules remain ordinary CPU PyTorch operations.
+    """
+    routed = 0
+
+    for module in model.modules():
+        if not hasattr(module, "base_layer"):
+            continue
+
+        base = module.base_layer
+
+        if not isinstance(base, nn.Linear):
+            continue
+
+        module.base_layer = DcpuRoutedLinear(base)
+        routed += 1
+
+    return routed
