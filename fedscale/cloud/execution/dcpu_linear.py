@@ -21,11 +21,10 @@ class _DcpuBaseLinearFunction(torch.autograd.Function):
         grad_input = None
 
         if ctx.needs_input_grad[0]:
-            grad_input = torch.mm(
-                grad_output.contiguous(),
-                weight,
-            )
-
+           grad_input = torch.ops.torch_dcpu.mm_cpu(
+            grad_output.contiguous(),
+            weight,
+           )
         # Frozen base weight and bias: no gradients.
         return grad_input, None, None
 

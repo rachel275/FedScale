@@ -3,8 +3,13 @@ import json
 import logging
 import os
 import sys
-import torchvision.models as tormodels
-from torchvision import datasets, transforms
+try:
+    import torchvision.models as tormodels
+    from torchvision import datasets, transforms
+except ImportError:
+    tormodels = None
+    datasets = None
+    transforms = None
 
 # libs from fedscale
 import fedscale.cloud.config_parser as parser
@@ -299,7 +304,7 @@ def init_model():
 
                 model = prepare_model_for_kbit_training(
                     model,
-                    use_gradient_checkpointing=True,
+                    use_gradient_checkpointing=False,
                 )
 
             if "distilbert" in model_name_lower:
