@@ -241,7 +241,7 @@ def init_model():
                     load_in_4bit=True,
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_compute_dtype=torch.float32,
                 )
 
                 model = AutoModelForCausalLM.from_pretrained(
@@ -297,10 +297,7 @@ def init_model():
                     "Preparing quantized model for QLoRA training"
                 )
 
-                model = prepare_model_for_kbit_training(
-                    model,
-                    use_gradient_checkpointing=True,
-                )
+                model = prepare_model_for_kbit_training(model)
 
             if "distilbert" in model_name_lower:
                 target_modules = [

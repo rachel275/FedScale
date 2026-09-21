@@ -100,9 +100,25 @@ class TorchClient(ClientBase):
                 name: tensor.detach().cpu().numpy().copy()
                 for name, tensor in model.state_dict().items()
             }
-        
+      
+        from fedscale.cloud.execution.dcpu_linear import DcpuRoutedLinear
+
+        print(
+            "[CLIENT BEFORE TO]",
+            f"id={id(model)}",
+            f"routed={sum(isinstance(m, DcpuRoutedLinear) for m in model.modules())}",
+            flush=True,
+        )
         if self.device.type != "dcpu":
             model = model.to(device=self.device)
+        
+        print(
+            "[CLIENT AFTER TO]",
+            f"id={id(model)}",
+            f"routed={sum(isinstance(m, DcpuRoutedLinear) for m in model.modules())}",
+            flush=True,
+        )
+
         model.train()
 
         trained_unique_samples = min(
@@ -123,6 +139,10 @@ class TorchClient(ClientBase):
             try:
                 self.train_step(client_data, conf, model, optimizer, criterion)
             except Exception as ex:
+                logging.exception(
+                    "Exception during train_step for client %s",
+                    client_id,
+                )
                 error_type = ex
                 break
 
@@ -509,16 +529,21 @@ class TorchClient(ClientBase):
             if profile_this_step:
                 prof.__exit__(None, None, None)
 
-                profile_dir = os.environ.get(
+
+                profile_root = os.environ.get(
                     "OPERATOR_PROFILE_DIR",
                     "/workspace/results",
+                )
+
+                profile_dir = os.path.join(
+                    profile_root,
+                    f"executor-{conf.client_id}",
                 )
 
                 os.makedirs(
                     profile_dir,
                     exist_ok=True,
                 )
-
                 # --------------------------------------------------------
                 # 1. Full operator table
                 # --------------------------------------------------------

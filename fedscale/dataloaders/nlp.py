@@ -39,7 +39,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-N_JOBS = cpu_count()
+N_JOBS = 4
 logger = logging.getLogger(__name__)
 
 

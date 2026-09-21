@@ -88,7 +88,7 @@ class Executor(object):
         self.training_sets = self.test_dataset = None
 
         # ======== channels ========
-        self.aggregator_communicator = ClientConnections(args.ps_ip, args.ps_port)
+        #self.aggregator_communicator = ClientConnections(args.ps_ip, args.ps_port)
 
         self.last_model_download_duration_s = None
         self.last_model_download_bytes = 0
@@ -186,13 +186,83 @@ class Executor(object):
 
         return training_sets, testing_sets
 
-    def run(self):
+    def run_training(self):
+        """Run client training locally without aggregator orchestration."""
+
+        num_rounds = self.args.rounds
+        client_id = int(self.this_rank)
+
+        logging.info(
+            "Starting local training: executor=%s client=%d rounds=%d",
+            self.executor_id,
+            client_id,
+            num_rounds,
+        )
+
+        for round_number in range(1, num_rounds + 1):
+            self.round = round_number
+
+            logging.info(
+                "Starting round %d/%d for client %d",
+                round_number,
+                num_rounds,
+                client_id,
+            )
+
+            conf = self.override_conf({})
+
+            start = time.perf_counter()
+
+            train_res = self.training_handler(
+                client_id=client_id,
+                conf=conf,
+            )
+
+            duration = time.perf_counter() - start
+
+            self._append_jsonl(
+                self.client_update_log_path,
+                {
+                    "timestamp": time.time(),
+                    "round": round_number,
+                    "executor_id": self.executor_id,
+                    "client_id": client_id,
+                    "model": getattr(self.args, "model", ""),
+                    "method": getattr(self.args, "method", "full"),
+                    "real_training_duration_s": float(
+                        train_res.get(
+                            "real_training_duration_s",
+                            duration,
+                        )
+                    ),
+                    "end_to_end_client_update_s": duration,
+                },
+            )
+
+            logging.info(
+                "Completed round %d/%d for client %d in %.3f s",
+                round_number,
+                num_rounds,
+                client_id,
+                duration,
+            )
+
+        logging.info("Local training complete")
+
+    #def run(self):
         """Start running the executor by setting up execution and communication environment, and monitoring the grpc message."""
+     #   self.setup_env()
+     #   self.training_sets, self.testing_sets = self.init_data()
+     #   self.setup_communication()
+     #   self.event_monitor()
+    def run(self):
+        """Run local FedScale training without an aggregator."""
+
         self.setup_env()
         self.training_sets, self.testing_sets = self.init_data()
-        self.setup_communication()
-        self.event_monitor()
 
+        self.run_training()
+    
     def dispatch_worker_events(self, request, rpc_duration_s=None):
         """Add new events to worker queues.
 
@@ -545,6 +615,16 @@ class Executor(object):
         )
         client = self.get_client_trainer(self.args)
         gemm_trace.set_client_id(client_id)
+
+        from fedscale.cloud.execution.dcpu_linear import DcpuRoutedLinear
+        train_model = self.model_adapter.get_model()
+
+        print(
+            "[BEFORE CLIENT]",
+            f"id={id(train_model)}",
+            f"routed={sum(isinstance(m, DcpuRoutedLinear) for m in train_model.modules())}",
+            flush=True,
+        )
 
         try:
             train_res = client.train(
